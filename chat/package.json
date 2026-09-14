@@ -1,0 +1,25 @@
+{
+  "name": "projeto-sistemas-distribuidos",
+  "version": "1.0.0",
+  "description": "",
+  "main": "broker.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GiovanniMoreira1/Projeto-Sistemas-Distribuidos.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/GiovanniMoreira1/Projeto-Sistemas-Distribuidos/issues"
+  },
+  "homepage": "https://github.com/GiovanniMoreira1/Projeto-Sistemas-Distribuidos#readme",
+  "dependencies": {
+    "@msgpack/msgpack": "^3.1.3",
+    "zeromq": "^6.8.0"
+  }
+}
