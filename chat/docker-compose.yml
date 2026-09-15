@@ -10,6 +10,9 @@ services:
   server:
     build: .
     command: node servidor.js
+    volumes:
+      - .:/app
+      - /app/node_modules
     depends_on:
       - broker
 
