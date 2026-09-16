@@ -1,0 +1,32 @@
+services:
+  broker:
+    build: .
+    command: ["sd.projeto.broker.Broker"]
+
+  server1:
+    build: .
+    command: ["sd.projeto.server.Server"]
+    depends_on:
+      - broker
+    volumes:
+      - server1_data:/app
+
+  server2:
+    build: .
+    command: ["sd.projeto.server.Server"]
+    depends_on:
+      - broker
+    volumes:
+      - server2_data:/app
+
+  client:
+    build: .
+    command: ["sd.projeto.client.Client"]
+    depends_on:
+      - broker
+    deploy:
+      replicas: 2
+
+volumes:
+  server1_data:
+  server2_data:

@@ -1,0 +1,12 @@
+# build
+target/
+dependency-reduced-pom.xml
+
+# dados gerados em runtime (nao sao codigo fonte)
+login.txt
+canais.txt
+
+# SO / editor
+.DS_Store
+.idea/
+*.iml

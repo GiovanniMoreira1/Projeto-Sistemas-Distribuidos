@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package sd.projeto;
+
+option java_multiple_files = true;
+option java_package = "sd.projeto.protos";
+option java_outer_classname = "EnvelopeProto";
+
+message Envelope {
+  int64 timestamp = 1;
+  string acao = 2;
+  string conteudo = 3;
+}
