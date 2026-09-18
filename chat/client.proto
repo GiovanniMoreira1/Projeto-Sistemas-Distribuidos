@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+message Mensagem {
+  float timestamp = 1;
+  string acao = 2;
+  string conteudo = 3;
+}
+
+message Resposta{
+  string status = 1;
+  string resposta = 2;
+}
