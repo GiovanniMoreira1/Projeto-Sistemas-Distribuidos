@@ -1,0 +1,24 @@
+
+services:
+  broker:
+    build: .
+    command: dotnet broker/Broker.dll
+    ports:
+      - "5559:5559"
+      - "5560:5560"
+
+  server:
+    build: .
+    command: dotnet servidor/Servidor.dll
+    volumes:
+      - ./usuarios.json:/app/usuarios.json
+      - ./canais.json:/app/canais.json
+      - ./login.json:/app/login.json
+    depends_on:
+      - broker
+
+  client:
+    build: .
+    command: dotnet cliente/Cliente.dll
+    depends_on:
+      - broker
