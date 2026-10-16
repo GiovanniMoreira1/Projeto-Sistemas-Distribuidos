@@ -73,3 +73,19 @@ run();
 process.on("SIGINT", function () {
   process.exit(0);
 });
+
+async function publicar(texto, canal, zmq){
+ var pub = zmq.Publisher();
+
+  await pub.bind("tcp://localhost:5559")
+  var contador = 0;
+
+  let mensagem = canal + " " + texto;
+
+  while(contador == 10){
+    await pub.send(mensagem)
+    await new Promise(resolve => {
+      setTimeout(resolve, 500)
+    })
+  }
+}
