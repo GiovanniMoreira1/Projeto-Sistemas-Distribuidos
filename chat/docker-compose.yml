@@ -7,6 +7,13 @@ services:
       - "5559:5559"
       - "5560:5560"
 
+  proxy:
+    build: .
+    command: node proxy.js
+    ports:
+      - "5557:5557"
+      - "5558:5558"
+
   server:
     build: .
     command: node servidor.js
@@ -15,9 +22,13 @@ services:
       - /app/node_modules
     depends_on:
       - broker
+      - proxy
 
   client:
     build: .
     command: node client.js
+    deploy:
+      replicas: 3
     depends_on:
       - broker
+      - proxy

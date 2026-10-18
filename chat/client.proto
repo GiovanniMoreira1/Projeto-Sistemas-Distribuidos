@@ -3,10 +3,19 @@ syntax = "proto3";
 message Mensagem {
   float timestamp = 1;
   string acao = 2;
-  string conteudo = 3;
+  string canal = 3;
+  string conteudo = 4;
 }
 
 message Resposta{
   string status = 1;
   string resposta = 2;
+  repeated string canais = 3;
+}
+
+message RespostaSub{
+  float timestampEnvio = 1;
+  string canal = 2;
+  string conteudo = 3;
+  float timestampRecebimento = 4;
 }

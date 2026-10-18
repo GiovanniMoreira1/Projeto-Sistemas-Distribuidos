@@ -1,9 +1,7 @@
-import { Request } from "zeromq";
+import { Request, Subscriber } from "zeromq";
 
 import protobuf from "protobufjs";
 
-// Métodos para escolha aleatória de elementos em um array, caso queira usar futuramente:
-// const randomElement = arr[Math.floor(Math.random() * arr.length)];
 
 async function run() {
   var usuarios = ["usuario1", "usuario2", "usuario3","teste", "usuario4", "usuario5"]
@@ -11,14 +9,19 @@ async function run() {
 
   const Mensagem = root.lookupType("Mensagem");
   const Resposta = root.lookupType("Resposta");
+  const RespostaSub = root.lookupType("RespostaSub");
 
   console.log("Cliente conectado no broker...");
+  
   const requester = new Request();
-
+  const subscriber = new Subscriber();
+  
+  subscriber.connect("tcp://proxy:5558");
   requester.connect("tcp://broker:5559");
 
   var indiceUsuario = 0;
   var indiceCanal = 0;
+
   var reply = await login(requester, Mensagem, Resposta, usuarios[indiceUsuario]);
 
   while (reply.status != "200") {
@@ -36,22 +39,36 @@ async function run() {
   }
   
   var canais = await listarCanais(requester, Mensagem, Resposta);
-  indiceCanal = canais.resposta.length;
+  indiceCanal = canais.canais.length;
   indiceCanal += 1;
-  if (canais.resposta.length < 5) {
+  if (canais.canais.length < 5) {
     console.log("Erro: quantidade de canais insuficiente. É necessário ter pelo menos 5 canais cadastrados.");
     indiceCanal += 1;
     await cadastrarCanal(requester, Mensagem, Resposta, `canal${indiceCanal}`);
   }
-  console.log("Canais disponiveis: " + canais.resposta);
+  console.log("Canais disponiveis: " + canais.canais.join(", "));
 
-  var teste2 = await cadastrarCanal(requester, Mensagem, Resposta, `canal${indiceCanal}`);
-  if (teste2.status == "200") {
-    console.log(teste2.resposta);
+  let valores = [];
+  for (var i = 0; i < 3; i++) {
+    const aleatorio = canais.canais[Math.floor(Math.random() * canais.canais.length)];
+    
+    if (valores.includes(aleatorio)) {
+      i--;
+      continue;
+    }else{
+      valores.push(aleatorio);
+      inscreverCanal(aleatorio, subscriber);
+    }
   }
-  else{
-    console.log("Erro:" + teste2.resposta);
+
+  receberPublicacoes(subscriber, RespostaSub).catch(console.error);
+
+  while (true) {
+    const aleatorio = canais.canais[Math.floor(Math.random() * canais.canais.length)];
+  
+    await publicarMensagem(requester, Mensagem, Resposta, aleatorio, `Mensagem de teste para o canal ${aleatorio}`);
   }
+
 
   requester.close();
   process.exit(0);
@@ -108,7 +125,7 @@ async function cadastrarCanal(requester, Mensagem, Resposta, canal) {
 async function deserializarMensagem(Resposta, request) {
   const buffer = Array.isArray(request) ? request[0] : request;
 
-  const requisicao = Resposta.decode(buffer); // também adicionei o "const" que faltava aqui
+  const requisicao = Resposta.decode(buffer);
 
   const objetoOriginal = Resposta.toObject(requisicao, {
     longs: String,
@@ -118,4 +135,36 @@ async function deserializarMensagem(Resposta, request) {
   });
 
   return objetoOriginal;
+}
+
+async function publicarMensagem(requester, Mensagem, Resposta, canal, mensagem) {
+  var timestamp = Date.now();
+
+  const payload = Mensagem.create({ timestamp: timestamp, acao: "publicar", canal: canal, conteudo: mensagem });
+
+  const bufferBinario = Mensagem.encode(payload).finish();
+
+  await requester.send(bufferBinario);
+
+  const reply = await requester.receive();
+
+  return deserializarMensagem(Resposta, reply);
+}
+
+function inscreverCanal(canal, subscriber) {
+  subscriber.subscribe(canal + "|");
+  console.log(`cliente inscrito no ${canal}`);
+}
+
+
+async function receberPublicacoes(subscriber, RespostaSub) {
+  for await (const [topic, msg] of subscriber) {
+    const dados = RespostaSub.toObject(RespostaSub.decode(msg), { longs: String, defaults: true });
+    console.log({
+      canal: dados.canal,
+      mensagem: dados.conteudo,
+      timestampEnvio: dados.timestampEnvio,
+      timestampRecebimento: Date.now(),
+    });
+  }
 }
