@@ -14,5 +14,7 @@ WORKDIR /app
 
 COPY  --from=build /app/target/canais-java-1.0-SNAPSHOT.jar app.jar
 
-ENTRYPOINT ["java", "-cp", "app.jar"]
+WORKDIR /data
+
+ENTRYPOINT ["java", "-cp", "/app/app.jar"]
 CMD ["sd.projeto.server.Server"]

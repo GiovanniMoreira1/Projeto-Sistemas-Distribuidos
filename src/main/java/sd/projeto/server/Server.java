@@ -21,10 +21,15 @@ public class Server
             ZMQ.Socket socket = context.createSocket(SocketType.REP);
             socket.connect("tcp://broker:5560");
 
+            ZMQ.Socket pub = context.createSocket(SocketType.PUB);
+            pub.connect("tcp://proxy:5557");
+
             List<String> canais = new ArrayList<>();
 
             Path arquivoLogins = Paths.get("login.txt");
             Path arquivosCanais = Paths.get("canais.txt");
+            Path arquivoPublicacoes = Paths.get("publicacoes.txt");
+            Path arquivoMensagens = Paths.get("mensagens.txt");
 
             if (Files.exists(arquivosCanais)){
                 String conteudoArquivo = Files.readString(arquivosCanais);
@@ -39,6 +44,7 @@ public class Server
 
                 
                 Envelope envelope = Envelope.parseFrom(reply);
+                registrar(arquivoMensagens, "req," + envelope.getTimestamp() + "," + envelope.getAcao() + "," + envelope.getConteudo());
                 System.out.println(
                     "[SERVER] Recebido: [" + envelope + "]"
                 );
@@ -64,9 +70,25 @@ public class Server
                     }
                 } else if (envelope.getAcao().equals("listar_canais")){
                     conteudo = String.join(",", canais);
+                } else if (envelope.getAcao().equals("publicar")) {
+                    String[] partes = envelope.getConteudo().split(",", 2);
+                    if (partes.length != 2 || partes[0].isBlank() || partes[1].isBlank()) {
+                        conteudo = "erro,formato invalido";
+                    } else {
+                        Envelope publicacao = Envelope.newBuilder()
+                            .setTimestamp(System.currentTimeMillis())
+                            .setAcao("publicacao")
+                            .setConteudo(envelope.getConteudo())
+                            .build();
+
+                        pub.send(partes[0] + "|", ZMQ.SNDMORE);
+                        pub.send(publicacao.toByteArray(), 0);
+
+                        registrar(arquivoPublicacoes, publicacao.getTimestamp() + "," + partes[0] + "," + partes[1]);
+                        conteudo = "sucesso,mensagem publicada";
+                    }
                 }
 
-                // Send a response
                 Envelope envelope_asr = Envelope.newBuilder()
                     .setTimestamp(System.currentTimeMillis())
                     .setAcao("resposta_" + envelope.getAcao())
@@ -74,8 +96,15 @@ public class Server
                     .build();
                 
                 byte[] data_asr = envelope_asr.toByteArray();
+                registrar(arquivoMensagens, "resp," + envelope_asr.getTimestamp() + "," + envelope_asr.getAcao() + "," + envelope_asr.getConteudo());
                 socket.send(data_asr, 0);
             }
         }
+    }
+
+    private static void registrar(Path arquivo, String linha) throws Exception
+    {
+        Files.writeString(arquivo, linha + System.lineSeparator(),
+            StandardOpenOption.CREATE, StandardOpenOption.APPEND);
     }
 }

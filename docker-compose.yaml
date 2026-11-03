@@ -3,27 +3,34 @@ services:
     build: .
     command: ["sd.projeto.broker.Broker"]
 
+  proxy:
+    build: .
+    command: ["sd.projeto.proxy.Proxy"]
+
   server1:
     build: .
     command: ["sd.projeto.server.Server"]
     depends_on:
       - broker
+      - proxy
     volumes:
-      - server1_data:/app
+      - server1_data:/data
 
   server2:
     build: .
     command: ["sd.projeto.server.Server"]
     depends_on:
       - broker
+      - proxy
     volumes:
-      - server2_data:/app
+      - server2_data:/data
 
   client:
     build: .
     command: ["sd.projeto.client.Client"]
     depends_on:
       - broker
+      - proxy
     deploy:
       replicas: 2
 
