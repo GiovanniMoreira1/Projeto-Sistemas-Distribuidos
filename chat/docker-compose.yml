@@ -1,21 +1,37 @@
 
 services:
   broker:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     command: node broker.js
     ports:
       - "5559:5559"
       - "5560:5560"
+    expose:
+      - "5556"
 
   proxy:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     command: node proxy.js
     ports:
       - "5557:5557"
       - "5558:5558"
 
+  referencia:
+    build:
+      context: .
+      dockerfile: Dockerfile.referencia
+    command: python referencia.py
+    depends_on:
+      - broker
+
   server:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     command: node servidor.js
     volumes:
       - .:/app
@@ -23,12 +39,14 @@ services:
     depends_on:
       - broker
       - proxy
+      - referencia
 
   client:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     command: node client.js
-    deploy:
-      replicas: 3
     depends_on:
       - broker
       - proxy
+      - server
