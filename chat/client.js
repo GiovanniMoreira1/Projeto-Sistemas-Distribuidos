@@ -84,7 +84,7 @@ process.on("SIGINT", function () {
 async function login(requester, Mensagem, Resposta, usuario) {
   var timestamp = Date.now();
   contadorMensagem++;
-  const payload = Mensagem.create({ timestamp: timestamp, acao: "login", conteudo: usuario, contadorMensagens: contadorMensagem });
+  const payload = Mensagem.create({ timestamp: timestamp, acao: "login", conteudo: usuario, contadorMensagem: contadorMensagem });
 
   const bufferBinario = Mensagem.encode(payload).finish();
 
@@ -98,7 +98,7 @@ async function login(requester, Mensagem, Resposta, usuario) {
 async function listarCanais(requester, Mensagem, Resposta) {
   var timestamp = Date.now();
   contadorMensagem++;
-  const payload = Mensagem.create({ timestamp: timestamp, acao: "listar", contadorMensagens: contadorMensagem });
+  const payload = Mensagem.create({ timestamp: timestamp, acao: "listar", contadorMensagem: contadorMensagem });
 
   const bufferBinario = Mensagem.encode(payload).finish();
 
@@ -112,7 +112,7 @@ async function listarCanais(requester, Mensagem, Resposta) {
 async function cadastrarCanal(requester, Mensagem, Resposta, canal) {
   var timestamp = Date.now();
   contadorMensagem++;
-  const payload = Mensagem.create({ timestamp: timestamp, acao: "cadastrar", conteudo: canal, contadorMensagens: contadorMensagem });
+  const payload = Mensagem.create({ timestamp: timestamp, acao: "cadastrar", conteudo: canal, contadorMensagem: contadorMensagem });
 
   const bufferBinario = Mensagem.encode(payload).finish();
 
@@ -136,7 +136,7 @@ async function deserializarMensagem(Resposta, request) {
     defaults: true,
   });
 
-  contadorMensagem = Math.max(contadorMensagem, Number(objetoOriginal.contadorMensagen));
+  contadorMensagem = Math.max(contadorMensagem, Number(objetoOriginal.contadorMensagem));
 
   return objetoOriginal;
 }
@@ -144,7 +144,7 @@ async function deserializarMensagem(Resposta, request) {
 async function publicarMensagem(requester, Mensagem, Resposta, canal, mensagem) {
   var timestamp = Date.now();
   contadorMensagem++;
-  const payload = Mensagem.create({ timestamp: timestamp, acao: "publicar", canal: canal, conteudo: mensagem, contadorMensagens: contadorMensagem });
+  const payload = Mensagem.create({ timestamp: timestamp, acao: "publicar", canal: canal, conteudo: mensagem, contadorMensagem: contadorMensagem });
 
   const bufferBinario = Mensagem.encode(payload).finish();
 
@@ -169,7 +169,7 @@ async function receberPublicacoes(subscriber, RespostaSub) {
       mensagem: dados.conteudo,
       timestampEnvio: dados.timestampEnvio,
       timestampRecebimento: Date.now(),
-      contadorMensagens: dados.contadorMensagens
+      contadorMensagem: dados.contadorMensagem
     });
 
     contadorMensagem = Math.max(contadorMensagem, Number(dados.contadorMensagens));

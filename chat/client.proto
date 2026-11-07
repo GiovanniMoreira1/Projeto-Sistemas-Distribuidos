@@ -34,6 +34,6 @@ message RespostaReferencia {
   string resposta = 2;
   int32 rank = 3;
   repeated ServidorInfo servidores = 4;
-  double timestamp = 5;
-  int32 contadorMensagem = 6;
+  int32 contadorMensagem = 5;
+  string servidorEleito = 6;
 }

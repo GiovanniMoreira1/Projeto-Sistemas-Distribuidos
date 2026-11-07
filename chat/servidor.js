@@ -1,50 +1,63 @@
-
-import { Reply, Publisher, Request } from "zeromq";
+import { Reply, Publisher, Request, Subscriber } from "zeromq";
 import fs from "fs/promises";
 import protobuf from "protobufjs";
 
-// Dados persistidos
 var usuarios = JSON.parse(await fs.readFile("usuarios.json", "utf-8"));
 var canais = JSON.parse(await fs.readFile("canais.json", "utf-8"));
 var logins = JSON.parse(await fs.readFile("login.json", "utf-8"));
 var publicacoes = JSON.parse(await fs.readFile("publicacoes.json", "utf-8"));
 var mensagens = JSON.parse(await fs.readFile("mensagens.json", "utf-8"));
 
-// Relógio lógico
 var contadorMensagens = 0;
 
-// Quantidade de mensagens recebidas dos bots
 var mensagensRecebidas = 0;
 
-// Relógio físico sincronizado
-var timestampReferencia = Date.now();
+var offsetRelogio = 0;
 
-// Identificação do servidor
 const NOME_SERVIDOR = "servidorJavaScript";
+// const NOME_SERVIDOR = process.env.NOME_SERVIDOR || "servidorJavaScript";
+const PORTA_SERVIDORES = 5559;
+const TEMPO_LIMITE_MS = 3000;
 
+var Mensagem;
 var Resposta;
+var RespostaSub;
+var RespostaReferencia;
+
+var rankServidor = 0;
+
+var servidorEleito = "";
+
+var emEleicao = false;
+var anuncioRecebido = false;
 
 async function run() {
 
     const root = await protobuf.load("client.proto");
 
-    const Mensagem = root.lookupType("Mensagem");
+    Mensagem = root.lookupType("Mensagem");
     Resposta = root.lookupType("Resposta");
-    const RespostaSub = root.lookupType("RespostaSub");
-    const RespostaReferencia = root.lookupType("RespostaReferencia");
+    RespostaSub = root.lookupType("RespostaSub");
+    RespostaReferencia = root.lookupType("RespostaReferencia");
 
-    // Socket para receber requisições dos bots
     const responder = new Reply();
 
-    // Socket para publicar mensagens
+    const respostaServidores = new Reply();
+
     const pub = new Publisher();
 
-    // Socket exclusivo para comunicação com a referência
+    const sub = new Subscriber();
+
     const referencia = new Request();
 
     pub.connect("tcp://proxy:5557");
 
+    sub.connect("tcp://proxy:5558");
+    sub.subscribe("servers");
+
     responder.connect("tcp://broker:5560");
+
+    await respostaServidores.bind("tcp://*:" + PORTA_SERVIDORES);
 
     referencia.connect("tcp://referencia:5556");
 
@@ -52,8 +65,7 @@ async function run() {
     console.log("Servidor conectado ao proxy...");
     console.log("Servidor conectado à referência...");
 
-    // Consulta o rank antes de começar a receber clientes
-    const rankServidor = await consultarRank(
+    rankServidor = await consultarRank(
         referencia,
         Mensagem,
         RespostaReferencia
@@ -61,11 +73,15 @@ async function run() {
 
     console.log("Rank do servidor:", rankServidor);
 
+    ouvirAnuncios(sub);
+    atenderServidores(respostaServidores, pub);
+
+    iniciarEleicao(pub);
+
     for await (const [request] of responder) {
 
         try {
 
-            // Recebe mensagem do bot
             const requisicao = Mensagem.decode(request);
 
             const objetoOriginal = Mensagem.toObject(requisicao, {
@@ -75,16 +91,13 @@ async function run() {
                 defaults: true
             });
 
-            // Atualiza relógio lógico ao receber
             contadorMensagens = Math.max(
                 contadorMensagens,
                 Number(objetoOriginal.contadorMensagem)
             );
 
-            // Contabiliza somente mensagens dos clientes
             mensagensRecebidas++;
 
-            // Heartbeat a cada 10 mensagens recebidas
             if (mensagensRecebidas % 10 === 0) {
 
                 await heartbeat(
@@ -92,6 +105,11 @@ async function run() {
                     Mensagem,
                     RespostaReferencia
                 );
+            }
+
+            if (mensagensRecebidas % 15 === 0) {
+
+                await sincronizarComServidorEleito(pub);
             }
 
             mensagens.push({
@@ -305,7 +323,6 @@ async function run() {
     }
 }
 
-// Cria resposta normal para os bots
 function criarResposta(Resposta, status, resposta, listaCanais = []) {
 
     contadorMensagens++;
@@ -314,12 +331,11 @@ function criarResposta(Resposta, status, resposta, listaCanais = []) {
         status: status,
         resposta: resposta,
         canais: listaCanais,
-        timestamp: Date.now(),
+        timestamp: Date.now() + offsetRelogio,
         contadorMensagem: contadorMensagens
     });
 }
 
-// Envia resposta ao bot
 async function enviarResposta(socket, payload) {
 
     await socket.send(
@@ -327,7 +343,6 @@ async function enviarResposta(socket, payload) {
     );
 }
 
-// Codificação da resposta
 function RespostaEncode(payload) {
     return Resposta.encode(payload).finish();
 }
@@ -342,7 +357,46 @@ async function salvarMensagens() {
     );
 }
 
-// Consulta rank e cadastra o servidor na referência
+async function requisitar(url, payload, Tipo) {
+
+    const socket = new Request({
+        sendTimeout: TEMPO_LIMITE_MS,
+        receiveTimeout: TEMPO_LIMITE_MS,
+        linger: 0
+    });
+
+    try {
+
+        socket.connect(url);
+
+        await socket.send(
+            Mensagem.encode(payload).finish()
+        );
+
+        const [reply] = await socket.receive();
+
+        const objeto = Tipo.toObject(Tipo.decode(reply), {
+            longs: Number,
+            defaults: true
+        });
+
+        contadorMensagens = Math.max(
+            contadorMensagens,
+            Number(objeto.contadorMensagem)
+        );
+
+        return objeto;
+
+    } catch (error) {
+
+        return null;
+
+    } finally {
+
+        socket.close();
+    }
+}
+
 async function consultarRank(
     requester,
     Mensagem,
@@ -352,50 +406,9 @@ async function consultarRank(
     contadorMensagens++;
 
     const payload = Mensagem.create({
-        timestamp: Date.now(),
+        timestamp: Date.now() + offsetRelogio,
         acao: "consultar_rank",
         conteudo: NOME_SERVIDOR,
-        contadorMensagem: contadorMensagens
-    });
-    
-    await requester.send(
-      Mensagem.encode(payload).finish()
-    );
-    
-    const [reply] = await requester.receive();
-
-    const resposta = RespostaReferencia.decode(reply);
-    
-    const objeto = RespostaReferencia.toObject(resposta, {
-      defaults: true
-    });
-
-    contadorMensagens = Math.max(
-        contadorMensagens,
-        Number(objeto.contadorMensagem)
-    );
-
-    if (objeto.status !== "200") {
-        throw new Error(objeto.resposta);
-    }
-
-    timestampReferencia = Number(objeto.timestamp);
-
-    return objeto.rank;
-}
-
-// Consulta a lista de servidores disponíveis
-async function listarServidores(
-    requester,
-    Mensagem,
-    RespostaReferencia
-) {
-
-    contadorMensagens++;
-
-    const payload = Mensagem.create({
-        timestamp: Date.now(),
-        acao: "listar",
         contadorMensagem: contadorMensagens
     });
 
@@ -403,7 +416,7 @@ async function listarServidores(
         Mensagem.encode(payload).finish()
     );
 
-    const reply = await requester.receive();
+    const [reply] = await requester.receive();
 
     const resposta = RespostaReferencia.decode(reply);
 
@@ -416,10 +429,278 @@ async function listarServidores(
         Number(objeto.contadorMensagem)
     );
 
+    if (objeto.status !== "200") {
+        throw new Error(objeto.resposta);
+    }
+
+    return objeto.rank;
+}
+
+async function listarServidores() {
+
+    contadorMensagens++;
+
+    const payload = Mensagem.create({
+        timestamp: Date.now() + offsetRelogio,
+        acao: "listar_servidores",
+        conteudo: NOME_SERVIDOR,
+        contadorMensagem: contadorMensagens
+    });
+
+    const objeto = await requisitar(
+        "tcp://referencia:5556",
+        payload,
+        RespostaReferencia
+    );
+
+    if (objeto === null || objeto.status !== "200") {
+        return [];
+    }
+
     return objeto.servidores;
 }
 
-// Heartbeat e sincronização do relógio físico
+async function iniciarEleicao(pub) {
+
+    if (emEleicao) {
+        return;
+    }
+
+    emEleicao = true;
+    anuncioRecebido = false;
+
+    console.log("Iniciando eleição...");
+
+    try {
+
+        const servidores = await listarServidores();
+
+        const maiores = servidores.filter(
+            s => s.rank > rankServidor && s.nome !== NOME_SERVIDOR
+        );
+
+        let algumRespondeu = false;
+
+        for (const alvo of maiores) {
+
+            contadorMensagens++;
+
+            const payload = Mensagem.create({
+                timestamp: Date.now() + offsetRelogio,
+                acao: "eleicao",
+                conteudo: NOME_SERVIDOR,
+                contadorMensagem: contadorMensagens
+            });
+
+            const objeto = await requisitar(
+                "tcp://" + alvo.nome + ":" + PORTA_SERVIDORES,
+                payload,
+                Resposta
+            );
+
+            if (objeto !== null && objeto.resposta === "OK") {
+                algumRespondeu = true;
+            }
+        }
+
+        if (algumRespondeu) {
+
+            console.log("Servidor de rank maior assumiu a eleição. Aguardando anúncio...");
+
+            setTimeout(() => {
+                if (!anuncioRecebido) {
+                    iniciarEleicao(pub);
+                }
+            }, 10000);
+
+        } else {
+
+            servidorEleito = NOME_SERVIDOR;
+            offsetRelogio = 0;
+            anuncioRecebido = true;
+
+            console.log("Servidor eleito como coordenador:", servidorEleito);
+
+            await anunciarCoordenador(pub);
+        }
+
+    } finally {
+
+        emEleicao = false;
+    }
+}
+
+async function anunciarCoordenador(pub) {
+
+    contadorMensagens++;
+
+    const payloadSub = RespostaSub.create({
+        timestampEnvio: Date.now() + offsetRelogio,
+        canal: "servers",
+        conteudo: NOME_SERVIDOR,
+        contadorMensagem: contadorMensagens
+    });
+
+    await pub.send([
+        "servers|",
+        RespostaSub.encode(payloadSub).finish()
+    ]);
+}
+
+async function ouvirAnuncios(sub) {
+
+    for await (const [topico, msg] of sub) {
+
+        try {
+
+            const objeto = RespostaSub.toObject(RespostaSub.decode(msg), {
+                longs: Number,
+                defaults: true
+            });
+
+            contadorMensagens = Math.max(
+                contadorMensagens,
+                Number(objeto.contadorMensagem)
+            );
+
+            servidorEleito = objeto.conteudo;
+            anuncioRecebido = true;
+
+            console.log("Novo coordenador anunciado:", servidorEleito);
+
+        } catch (error) {
+
+            console.log("Erro ao processar anúncio:", error);
+        }
+    }
+}
+
+async function atenderServidores(socket, pub) {
+
+    for await (const [request] of socket) {
+
+        try {
+
+            const requisicao = Mensagem.decode(request);
+
+            const objeto = Mensagem.toObject(requisicao, {
+                longs: Number,
+                defaults: true
+            });
+
+            contadorMensagens = Math.max(
+                contadorMensagens,
+                Number(objeto.contadorMensagem)
+            );
+
+            if (objeto.acao === "eleicao") {
+
+                const payload = criarResposta(Resposta, "200", "OK");
+
+                await enviarResposta(socket, payload);
+
+                iniciarEleicao(pub);
+            }
+
+            else if (objeto.acao === "sincronizar") {
+
+                if (servidorEleito === NOME_SERVIDOR) {
+
+                    const payload = criarResposta(
+                        Resposta,
+                        "200",
+                        "Hora correta"
+                    );
+
+                    await enviarResposta(socket, payload);
+
+                } else {
+
+                    const payload = criarResposta(
+                        Resposta,
+                        "400",
+                        "Não sou o coordenador!"
+                    );
+
+                    await enviarResposta(socket, payload);
+                }
+            }
+
+            else {
+
+                const payload = criarResposta(
+                    Resposta,
+                    "400",
+                    "Ação desconhecida!"
+                );
+
+                await enviarResposta(socket, payload);
+            }
+
+        } catch (error) {
+
+            console.log("Erro ao atender servidor:", error);
+
+            const payload = criarResposta(
+                Resposta,
+                "500",
+                "Erro interno no servidor!"
+            );
+
+            await enviarResposta(socket, payload);
+        }
+    }
+}
+
+async function sincronizarComServidorEleito(pub) {
+
+    if (servidorEleito === "") {
+        iniciarEleicao(pub);
+        return;
+    }
+
+    if (servidorEleito === NOME_SERVIDOR) {
+        console.log("Este servidor é o coordenador. Relógio mantido.");
+        return;
+    }
+
+    contadorMensagens++;
+
+    const payload = Mensagem.create({
+        timestamp: Date.now() + offsetRelogio,
+        acao: "sincronizar",
+        conteudo: NOME_SERVIDOR,
+        contadorMensagem: contadorMensagens
+    });
+
+    const t0 = Date.now();
+
+    const objeto = await requisitar(
+        "tcp://" + servidorEleito + ":" + PORTA_SERVIDORES,
+        payload,
+        Resposta
+    );
+
+    const t1 = Date.now();
+
+    if (objeto === null || objeto.status !== "200") {
+
+        console.log("Coordenador indisponível. Iniciando eleição...");
+
+        iniciarEleicao(pub);
+        return;
+    }
+
+    const horaCoordenador = Number(objeto.timestamp) + (t1 - t0) / 2;
+
+    offsetRelogio = horaCoordenador - t1;
+
+    console.log(
+        "Relógio sincronizado com " + servidorEleito + ":",
+        new Date(Date.now() + offsetRelogio).toISOString()
+    );
+}
+
 async function heartbeat(
     requester,
     Mensagem,
@@ -429,7 +710,7 @@ async function heartbeat(
     contadorMensagens++;
 
     const payload = Mensagem.create({
-        timestamp: Date.now(),
+        timestamp: Date.now() + offsetRelogio,
         acao: "heartbeat",
         conteudo: NOME_SERVIDOR,
         contadorMensagem: contadorMensagens
@@ -454,12 +735,7 @@ async function heartbeat(
 
     if (objeto.status === "200") {
 
-        timestampReferencia = Number(objeto.timestamp);
-
-        console.log(
-            "Heartbeat confirmado. Horário sincronizado:",
-            new Date(timestampReferencia).toISOString()
-        );
+        console.log("Heartbeat confirmado.");
 
     } else {
 
@@ -469,7 +745,6 @@ async function heartbeat(
     return objeto;
 }
 
-// Publicação de mensagens nos canais
 async function publicar(pub, objetoOriginal, RespostaSub) {
 
     let contador = 1;
@@ -479,7 +754,7 @@ async function publicar(pub, objetoOriginal, RespostaSub) {
         contadorMensagens++;
 
         const payloadSub = RespostaSub.create({
-            timestampEnvio: timestampReferencia,
+            timestampEnvio: Date.now() + offsetRelogio,
             canal: objetoOriginal.canal,
             conteudo: objetoOriginal.conteudo,
             contadorMensagem: contadorMensagens
