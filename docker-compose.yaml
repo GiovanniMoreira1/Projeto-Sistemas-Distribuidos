@@ -7,21 +7,29 @@ services:
     build: .
     command: ["sd.projeto.proxy.Proxy"]
 
+  referencia:
+    build: .
+    command: ["sd.projeto.referencia.Referencia"]
+
   server1:
     build: .
+    hostname: server1
     command: ["sd.projeto.server.Server"]
     depends_on:
       - broker
       - proxy
+      - referencia
     volumes:
       - server1_data:/data
 
   server2:
     build: .
+    hostname: server2
     command: ["sd.projeto.server.Server"]
     depends_on:
       - broker
       - proxy
+      - referencia
     volumes:
       - server2_data:/data
 

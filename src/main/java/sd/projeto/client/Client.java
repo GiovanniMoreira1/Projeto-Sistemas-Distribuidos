@@ -9,9 +9,13 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class Client
 {
+    // AtomicLong porque a thread receptora e a principal mexem no relogio ao mesmo tempo
+    private static final AtomicLong relogio = new AtomicLong(0);
+
     public static void main(String[] args) throws Exception
     {
         try (ZContext context = new ZContext()) {
@@ -31,6 +35,7 @@ public class Client
                     .setTimestamp(System.currentTimeMillis())
                     .setAcao("login")
                     .setConteudo("Felipe")
+                    .setContador(relogio.incrementAndGet())
                     .build();
                 byte[] data = envelope.toByteArray();
                 socket.send(data, 0);
@@ -39,6 +44,7 @@ public class Client
                 byte[] reply = socket.recv(0);
 
                 Envelope resposta = Envelope.parseFrom(reply);
+                atualizarRelogio(resposta.getContador());
 
                 if (resposta.getConteudo().startsWith("sucesso")){
                     System.out.println("[CLIENTE] Login realizado com sucesso");
@@ -74,12 +80,14 @@ public class Client
                         byte[] corpo = sub.recv(0);
 
                         Envelope pub = Envelope.parseFrom(corpo);
+                        atualizarRelogio(pub.getContador());
                         String[] partes = pub.getConteudo().split(",", 2);
 
                         System.out.println(
                             "[CLIENTE] Canal: " + partes[0] + " | Mensagem: " + partes[1]
                             + " | Envio: " + pub.getTimestamp()
                             + " | Recebimento: " + System.currentTimeMillis()
+                            + " | Relogio: " + pub.getContador()
                         );
                     } catch (ZMQException e) {
                         break;
@@ -115,11 +123,19 @@ public class Client
             .setTimestamp(System.currentTimeMillis())
             .setAcao(acao)
             .setConteudo(conteudo)
+            .setContador(relogio.incrementAndGet())
             .build();
         socket.send(envelope.toByteArray(), 0);
 
         byte[] reply = socket.recv(0);
-        return Envelope.parseFrom(reply);
+        Envelope resposta = Envelope.parseFrom(reply);
+        atualizarRelogio(resposta.getContador());
+        return resposta;
+    }
+
+    private static void atualizarRelogio(long recebido)
+    {
+        relogio.updateAndGet(atual -> Math.max(atual, recebido));
     }
 
     private static List<String> listarCanais(ZMQ.Socket socket) throws Exception

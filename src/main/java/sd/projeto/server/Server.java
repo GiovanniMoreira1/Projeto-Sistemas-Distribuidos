@@ -11,9 +11,13 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
+import java.net.InetAddress;
 
 public class Server
 {
+    private static long relogio = 0;
+    private static long diferencaRelogio = 0;
+
     public static void main(String[] args) throws Exception
     {
         try (ZContext context = new ZContext()) {
@@ -23,6 +27,19 @@ public class Server
 
             ZMQ.Socket pub = context.createSocket(SocketType.PUB);
             pub.connect("tcp://proxy:5557");
+
+            ZMQ.Socket referencia = context.createSocket(SocketType.REQ);
+            referencia.connect("tcp://referencia:5556");
+
+            String nome = InetAddress.getLocalHost().getHostName();
+            Envelope respostaRank = enviarReferencia(referencia, "rank", nome);
+            int rank = Integer.parseInt(respostaRank.getConteudo().split(",")[1]);
+            System.out.println("[SERVER] " + nome + " cadastrado na referencia com rank " + rank);
+
+            Envelope respostaLista = enviarReferencia(referencia, "list", "");
+            System.out.println("[SERVER] Servidores na referencia: " + respostaLista.getConteudo());
+
+            int mensagensRecebidas = 0;
 
             List<String> canais = new ArrayList<>();
 
@@ -44,6 +61,23 @@ public class Server
 
                 
                 Envelope envelope = Envelope.parseFrom(reply);
+                relogio = Math.max(relogio, envelope.getContador());
+
+                mensagensRecebidas++;
+                if (mensagensRecebidas % 10 == 0) {
+                    long antes = System.currentTimeMillis();
+                    Envelope hb = enviarReferencia(referencia, "heartbeat", nome);
+                    long ida_volta = System.currentTimeMillis() - antes;
+                    if (hb.getConteudo().startsWith("sucesso")) {
+                        // a hora da referencia ja esta velha quando chega, soma metade do tempo de ida e volta
+                        diferencaRelogio = hb.getTimestamp() + ida_volta / 2 - System.currentTimeMillis();
+                        System.out.println("[SERVER] Heartbeat ok, relogio ajustado em " + diferencaRelogio + " ms");
+                    } else {
+                        // referencia nao conhece mais esse servidor (removido por timeout), cadastra de novo
+                        enviarReferencia(referencia, "rank", nome);
+                    }
+                }
+
                 registrar(arquivoMensagens, "req," + envelope.getTimestamp() + "," + envelope.getAcao() + "," + envelope.getConteudo());
                 System.out.println(
                     "[SERVER] Recebido: [" + envelope + "]"
@@ -75,10 +109,12 @@ public class Server
                     if (partes.length != 2 || partes[0].isBlank() || partes[1].isBlank()) {
                         conteudo = "erro,formato invalido";
                     } else {
+                        relogio++;
                         Envelope publicacao = Envelope.newBuilder()
-                            .setTimestamp(System.currentTimeMillis())
+                            .setTimestamp(System.currentTimeMillis() + diferencaRelogio)
                             .setAcao("publicacao")
                             .setConteudo(envelope.getConteudo())
+                            .setContador(relogio)
                             .build();
 
                         pub.send(partes[0] + "|", ZMQ.SNDMORE);
@@ -89,10 +125,12 @@ public class Server
                     }
                 }
 
+                relogio++;
                 Envelope envelope_asr = Envelope.newBuilder()
-                    .setTimestamp(System.currentTimeMillis())
+                    .setTimestamp(System.currentTimeMillis() + diferencaRelogio)
                     .setAcao("resposta_" + envelope.getAcao())
                     .setConteudo(conteudo)
+                    .setContador(relogio)
                     .build();
                 
                 byte[] data_asr = envelope_asr.toByteArray();
@@ -100,6 +138,22 @@ public class Server
                 socket.send(data_asr, 0);
             }
         }
+    }
+
+    private static Envelope enviarReferencia(ZMQ.Socket socket, String acao, String conteudo) throws Exception
+    {
+        relogio++;
+        Envelope envelope = Envelope.newBuilder()
+            .setTimestamp(System.currentTimeMillis() + diferencaRelogio)
+            .setAcao(acao)
+            .setConteudo(conteudo)
+            .setContador(relogio)
+            .build();
+        socket.send(envelope.toByteArray(), 0);
+
+        Envelope resposta = Envelope.parseFrom(socket.recv(0));
+        relogio = Math.max(relogio, resposta.getContador());
+        return resposta;
     }
 
     private static void registrar(Path arquivo, String linha) throws Exception

@@ -107,3 +107,20 @@ docker compose down -v
 ## O que falta
 
 As Partes 1 e 2 foram implementadas. As Partes 3 a 5 ainda não foram feitas.
+
+
+## Parte 3 - relógios e heartbeat
+
+Agora tem um processo novo, a `Referencia`, que só conversa com os servidores (cliente nunca fala com ela). Ela é um socket REP na porta 5556 e o servidor fala com ela por um socket REQ. Usa o mesmo `Envelope` das outras partes, e nele entrou um campo novo `contador` (int64) com o valor do relógio lógico de quem mandou.
+
+**Relógio lógico**: cliente e servidor têm um contador que começa em 0. Antes de mandar qualquer mensagem o contador soma 1 e vai junto no `contador`. Quando chega mensagem, o contador vira o maior entre o que o processo tinha e o que veio na mensagem. Isso vale também pras publicações do pub/sub e pras mensagens com a referência.
+
+**Referência** (ações no campo `acao`, valores separados por vírgula como no resto):
+- `rank`: o servidor manda o nome dele, a referência cadastra (sem repetir nome) e responde `sucesso,<rank>`. O rank é um contador que só aumenta.
+- `list`: responde `sucesso,nome:rank;nome:rank`.
+- `heartbeat`: o servidor avisa que está vivo. Responde `sucesso,ok`.
+- Quem passa 30 segundos sem heartbeat sai da lista.
+
+**Relógio físico**: o servidor manda heartbeat a cada 10 mensagens de cliente recebidas. O `timestamp` da resposta da referência é a hora certa. O servidor guarda a diferença entre essa hora e a dele, e soma essa diferença em todos os timestamps que gera dali pra frente.
+
+O nome do servidor é o hostname do container (`server1`, `server2` no compose).
