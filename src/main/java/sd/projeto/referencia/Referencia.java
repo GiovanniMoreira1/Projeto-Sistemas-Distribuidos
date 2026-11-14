@@ -87,14 +87,15 @@ public class Referencia {
                 }
 
                 relogio++;
-                // o timestamp da resposta e a "hora correta" que os servidores usam pra sincronizar
-                Envelope resposta = Envelope.newBuilder()
-                    .setTimestamp(System.currentTimeMillis())
+                Envelope.Builder resposta = Envelope.newBuilder()
                     .setAcao("resposta_" + envelope.getAcao())
                     .setConteudo(conteudo)
-                    .setContador(relogio)
-                    .build();
-                socket.send(resposta.toByteArray(), 0);
+                    .setContador(relogio);
+                // heartbeat nao devolve mais a hora, quem acerta o relogio agora e o coordenador
+                if (!envelope.getAcao().equals("heartbeat")) {
+                    resposta.setTimestamp(System.currentTimeMillis());
+                }
+                socket.send(resposta.build().toByteArray(), 0);
             }
         }
     }

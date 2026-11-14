@@ -124,3 +124,21 @@ Agora tem um processo novo, a `Referencia`, que só conversa com os servidores (
 **Relógio físico**: o servidor manda heartbeat a cada 10 mensagens de cliente recebidas. O `timestamp` da resposta da referência é a hora certa. O servidor guarda a diferença entre essa hora e a dele, e soma essa diferença em todos os timestamps que gera dali pra frente.
 
 O nome do servidor é o hostname do container (`server1`, `server2` no compose).
+
+
+## Parte 4 - eleição
+
+Agora quem acerta o relógio dos servidores é um dos próprios servidores, o coordenador. A referência continua dando rank, guardando a lista e recebendo heartbeat, mas o heartbeat dela não devolve mais a hora.
+
+Cada servidor tem uma variável `coordenador` com o nome de quem foi eleito, e agora também abre um socket REP na porta 5561 pra conversar com os outros servidores. Usei o mesmo `Envelope` de sempre.
+
+**Eleição**: o algoritmo é o do valentão (bully), quem tem o maior rank ganha.
+1. O servidor pede a lista pra referência e manda `eleicao` pros servidores de rank maior que o dele.
+2. Se algum responder `sucesso,OK`, ele espera até 10 segundos o anúncio de quem ganhou (e o servidor que respondeu começa a própria eleição).
+3. Se ninguém de rank maior responder, ele se elege, zera a diferença do relógio e anuncia no tópico `servers` do proxy (a publicação leva o nome do coordenador).
+4. Todo servidor escuta o tópico `servers` e atualiza a variável `coordenador` quando chega anúncio.
+A eleição roda quando o servidor sobe e quando o coordenador não responde.
+
+**Relógio**: a cada 15 mensagens de cliente recebidas, o servidor manda `relogio` pro coordenador e recebe a hora correta no `timestamp` da resposta. Ele soma metade do tempo de ida e volta e guarda a diferença, que entra em todos os timestamps seguintes. Se o coordenador não responder em 3 segundos, o servidor pede eleição.
+
+O heartbeat continua a cada 10 mensagens, e o servidor se cadastra de novo se a referência tiver esquecido dele.
