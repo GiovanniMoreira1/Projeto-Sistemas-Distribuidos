@@ -81,8 +81,6 @@ def inscrever(canal):
     inscritos.add(canal)
     print(f"[{usuario}] inscrito no {canal}", flush=True)
 
-
-# ---- Login: em caso de erro, repete com outro nome ----
 candidatos = [USUARIOS[0]] + random.sample(USUARIOS[1:], len(USUARIOS) - 1)
 usuario = None
 for candidato in candidatos:
@@ -97,7 +95,6 @@ if usuario is None:
     print("Nenhum usuario da lista funcionou.", flush=True)
     sys.exit(1)
 
-# ---- Loop do bot ----
 while True:
     canais = list(requisitar("listar").canais)
 
