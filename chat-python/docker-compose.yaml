@@ -1,0 +1,48 @@
+x-servidor: &servidor
+  build: .
+  command: python servidor/main.py
+  volumes:
+    # cada servidor grava em dados/<NOME_SERVIDOR>/ (nenhum arquivo e compartilhado)
+    - ./dados:/app/dados
+  depends_on:
+    - broker
+    - proxy
+    - referencia
+
+services:
+  broker:
+    build: .
+    command: python broker/main.py
+
+  proxy:
+    build: .
+    command: python proxy/main.py
+
+  # servico de referencia: rank, lista de servidores e heartbeat (so conversa com servidores)
+  referencia:
+    build: .
+    command: python referencia/main.py
+
+  # O nome do servico = NOME_SERVIDOR = endereco usado pelos outros servidores (tcp://<nome>:5559).
+  # 2 servidores por integrante do grupo: o nome precisa ser unico entre todas as linguagens.
+  server-python-1:
+    <<: *servidor
+    environment:
+      NOME_SERVIDOR: server-python-1
+
+  server-python-2:
+    <<: *servidor
+    environment:
+      NOME_SERVIDOR: server-python-2
+
+  client:
+    build: .
+    command: python cliente/main.py
+    # 2 clientes por integrante do grupo
+    deploy:
+      replicas: 2
+    depends_on:
+      - broker
+      - proxy
+      - server-python-1
+      - server-python-2
