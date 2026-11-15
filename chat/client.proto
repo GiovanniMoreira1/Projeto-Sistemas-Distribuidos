@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+message Mensagem {
+  double timestamp = 1;
+  string acao = 2;
+  string canal = 3;
+  string conteudo = 4;
+  int32 contadorMensagem = 5;
+}
+
+message Resposta {
+  string status = 1;
+  string resposta = 2;
+  repeated string canais = 3;
+  int32 contadorMensagem = 4;
+  double timestamp = 5;
+}
+
+message RespostaSub {
+  double timestampEnvio = 1;
+  string canal = 2;
+  string conteudo = 3;
+  double timestampRecebimento = 4;
+  int32 contadorMensagem = 5;
+}
+
+message ServidorInfo {
+  string nome = 1;
+  int32 rank = 2;
+}
+
+message RespostaReferencia {
+  string status = 1;
+  string resposta = 2;
+  int32 rank = 3;
+  repeated ServidorInfo servidores = 4;
+  int32 contadorMensagem = 5;
+  string servidorEleito = 6;
+}

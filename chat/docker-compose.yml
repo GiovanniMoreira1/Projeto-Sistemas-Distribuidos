@@ -1,0 +1,48 @@
+services:
+  broker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: broker
+    ports:
+      - "5559:5559"
+      - "5560:5560"
+
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: proxy
+    ports:
+      - "5557:5557"
+      - "5558:5558"
+
+  referencia:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: referencia
+    depends_on:
+      - broker
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: servidor
+    environment:
+      - NOME_SERVIDOR=server
+    depends_on:
+      - broker
+      - proxy
+      - referencia
+
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: client
+    depends_on:
+      - broker
+      - proxy
+      - server
