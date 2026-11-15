@@ -1,24 +1,46 @@
+x-servidor: &servidor
+  build: .
+  command: dotnet servidor/Servidor.dll
+  volumes:
+    # cada servidor grava em dados/<NOME_SERVIDOR>/
+    - ./dados:/app/dados
+  depends_on:
+    - broker
+    - proxy
+    - referencia
 
 services:
   broker:
     build: .
     command: dotnet broker/Broker.dll
-    ports:
-      - "5559:5559"
-      - "5560:5560"
 
-  server:
+  proxy:
     build: .
-    command: dotnet servidor/Servidor.dll
-    volumes:
-      - ./usuarios.json:/app/usuarios.json
-      - ./canais.json:/app/canais.json
-      - ./login.json:/app/login.json
-    depends_on:
-      - broker
+    command: dotnet proxy/Proxy.dll
+
+  # servico de referencia: rank, lista de servidores e heartbeat
+  referencia:
+    build: .
+    command: dotnet referencia/Referencia.dll
+
+  # o nome do servico = NOME_SERVIDOR = endereco usado pelos outros servidores
+  server-csharp-1:
+    <<: *servidor
+    environment:
+      NOME_SERVIDOR: server-csharp-1
+
+  server-csharp-2:
+    <<: *servidor
+    environment:
+      NOME_SERVIDOR: server-csharp-2
 
   client:
     build: .
     command: dotnet cliente/Cliente.dll
+    deploy:
+      replicas: 2
     depends_on:
       - broker
+      - proxy
+      - server-csharp-1
+      - server-csharp-2

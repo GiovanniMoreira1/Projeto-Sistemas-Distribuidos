@@ -15,11 +15,11 @@ class CanaisArquivo
 class LoginEntrada
 {
     [JsonPropertyName("usuario")]
-    public string Usuario { get; set; } = "";
+    public string Usuario { get; set; } = string.Empty;
 
     [JsonPropertyName("timestamp")]
-    public float Timestamp { get; set; }
+    public double Timestamp { get; set; }
 
     [JsonPropertyName("status")]
-    public string Status { get; set; } = "";
+    public string Status { get; set; } = string.Empty;
 }
