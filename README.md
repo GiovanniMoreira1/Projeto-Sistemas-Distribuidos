@@ -59,20 +59,3 @@ Topicos: frame `"<canal>|"` + mensagem serializada; o anuncio do coordenador usa
 5. A cada 15 mensagens de clientes, o servidor pede a hora ao coordenador (`sincronizar`) e ajusta o seu relogio: `offset = hora_do_coordenador + RTT/2 - hora_local`. Se o coordenador nao responder em 3 s ou disser que nao e coordenador, o servidor inicia uma eleicao.
 
 O servico de referencia **nao devolve hora** no heartbeat; a hora vem somente do coordenador.
-
-Observacao: o fluxo segue os diagramas do enunciado (`REQ relogio -> REP hora correta`), isto e, o servidor pede a hora ao coordenador e corrige o proprio relogio; nao e o Berkeley completo, em que o coordenador consultaria todos e calcularia a media.
-
-## Outras escolhas
-
-**Acoes e status** (iguais aos demais servidores do grupo): `login` (200 / 404), `listar` (200), `cadastrar` (200 / 404 canal ja existe / 400 nome invalido), `publicar` (200 / 400 / 500).
-
-**Persistencia** (um diretorio por servidor, nada compartilhado): `usuarios.json`, `canais.json`, `login.json`, `mensagens.jsonl` (cada requisicao e resposta) e `publicacoes.jsonl` (cada publicacao). Os `.jsonl` so recebem linhas novas.
-
-**Parametros:** `NOME_SERVIDOR` (variavel de ambiente, padrao = nome da maquina). Heartbeat a cada 10 mensagens, sincronizacao a cada 15 e porta servidor-servidor 5559 sao constantes em `Servidor/Program.cs`.
-
-**Organizacao do codigo:** cada `Program.cs` e dividido em `#region`s (configuracao, comunicacao, eleicao, acoes dos clientes etc.) para facilitar a leitura.
-
-## Limitacoes conhecidas
-
-- Cada servidor tem seus proprios canais e nao ha replicacao: a listagem depende de qual servidor atendeu. Por isso `publicar` nao exige que o canal exista no servidor que recebeu o pedido.
-- Fora do Docker, a porta servidor-servidor 5559 colide com a do broker no mesmo host, e nao ha variavel de ambiente para trocar a porta.
