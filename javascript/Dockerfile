@@ -1,5 +1,5 @@
 # contexto de build: raiz do repositorio (usa proto/client.proto compartilhado)
-FROM node:18-bullseye
+FROM node:18-bookworm
 
 # Dependências de build para compilar o binding nativo do zeromq
 RUN apt-get update && apt-get install -y \

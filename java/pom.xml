@@ -45,6 +45,12 @@
       <artifactId>protobuf-java</artifactId>
       <version>4.36.1</version>
     </dependency>
+    <!-- leitura do usuarios.json e transferencia de estado entre servidores (Parte 5) -->
+    <dependency>
+      <groupId>com.google.code.gson</groupId>
+      <artifactId>gson</artifactId>
+      <version>2.11.0</version>
+    </dependency>
   </dependencies>
   <build>
       <pluginManagement>

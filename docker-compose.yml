@@ -25,6 +25,10 @@ x-servidor: &servidor
   volumes:
     - ./dados:/dados
   depends_on: [broker, proxy, referencia]
+  # Quando um servidor cai, o nome dele deixa de existir no DNS do Docker e a consulta leva ~8 s
+  # para falhar. O ZeroMQ resolve o nome dentro da sua thread de I/O, entao o processo inteiro
+  # ficaria travado esse tempo (e erraria a eleicao). Com timeout de 1 s a falha e rapida.
+  dns_opt: ["timeout:1", "attempts:1"]
 
 x-cliente: &cliente
   deploy:

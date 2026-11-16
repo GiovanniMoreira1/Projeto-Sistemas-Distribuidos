@@ -39,7 +39,7 @@ CAMINHO_PUBLICACOES = os.path.join(DIRETORIO, "publicacoes.jsonl")
 
 trava = threading.RLock()  # protege contador, offset, rank e coordenador (varias threads)
 contador = 0               # relogio logico
-#offset_ms = float(os.environ.get("DESVIO_RELOGIO_MS", "0"))
+offset_ms = float(os.environ.get("DESVIO_RELOGIO_MS", "0"))  # correcao do relogio fisico (Parte 4)
 rank = 0
 coordenador = ""           # nome do servidor eleito
 em_eleicao = False
@@ -95,12 +95,79 @@ def anexar_jsonl(caminho, registro):
         arquivo.write(json.dumps(registro, ensure_ascii=False) + "\n")
 
 
+def ler_jsonl(caminho):
+    if not os.path.exists(caminho):
+        return []
+    with open(caminho, encoding="utf-8") as arquivo:
+        return [json.loads(linha) for linha in arquivo if linha.strip()]
+
+
+def salvar_jsonl(caminho, registros):
+    temporario = caminho + ".tmp"
+    with open(temporario, "w", encoding="utf-8") as arquivo:
+        for registro in registros:
+            arquivo.write(json.dumps(registro, ensure_ascii=False) + "\n")
+    os.replace(temporario, caminho)
+
+
 if not os.path.exists(CAMINHO_USUARIOS):
     salvar_json(CAMINHO_USUARIOS, ler_json(SEED_USUARIOS, {"usuarios": []}))
 
 usuarios = ler_json(CAMINHO_USUARIOS, {"usuarios": []})
 canais = ler_json(CAMINHO_CANAIS, {"canais": []})
 logins = ler_json(CAMINHO_LOGINS, [])
+publicacoes = [
+    # formato antigo (Partes 2-4) guardava o timestamp do cliente em "timestampEnvioCliente"
+    {"canal": r["canal"], "conteudo": r["conteudo"],
+     "timestamp": r.get("timestamp", r.get("timestampEnvioCliente", 0))}
+    for r in ler_jsonl(CAMINHO_PUBLICACOES)
+]
+
+# Parte 5: os dados agora tambem sao alterados pela thread de replicacao
+trava_dados = threading.RLock()
+
+
+def chave_login(registro):
+    return (registro["usuario"], registro["timestamp"])
+
+
+def chave_publicacao(registro):
+    return (registro["canal"], registro["conteudo"], registro["timestamp"])
+
+
+# chaves do que ja esta guardado: aplicar a mesma operacao duas vezes nao duplica o registro
+logins_vistos = {chave_login(r) for r in logins}
+publicacoes_vistas = {chave_publicacao(r) for r in publicacoes}
+
+
+def registrar_login(usuario, timestamp, status):
+    registro = {"usuario": usuario, "timestamp": timestamp, "status": status}
+    with trava_dados:
+        if chave_login(registro) in logins_vistos:
+            return
+        logins_vistos.add(chave_login(registro))
+        logins.append(registro)
+        salvar_json(CAMINHO_LOGINS, logins)
+
+
+def registrar_canal(canal):
+    """Devolve False se o canal ja existia."""
+    with trava_dados:
+        if canal in canais["canais"]:
+            return False
+        canais["canais"].append(canal)
+        salvar_json(CAMINHO_CANAIS, canais)
+        return True
+
+
+def registrar_publicacao(canal, conteudo, timestamp):
+    registro = {"canal": canal, "conteudo": conteudo, "timestamp": timestamp}
+    with trava_dados:
+        if chave_publicacao(registro) in publicacoes_vistas:
+            return
+        publicacoes_vistas.add(chave_publicacao(registro))
+        publicacoes.append(registro)
+        anexar_jsonl(CAMINHO_PUBLICACOES, registro)
 
 
 def requisitar(url, acao, conteudo="", tipo=Resposta):
@@ -265,7 +332,10 @@ def atender_servidores():
             requisicao.ParseFromString(dados)
             atualizar_contador(requisicao.contadorMensagem)
 
-            if requisicao.acao == "eleicao":
+            if requisicao.acao == "obter_estado":  # Parte 5: transferencia de estado
+                resposta = criar_resposta("200", exportar_estado())
+                log(f"estado enviado para {requisicao.conteudo}")
+            elif requisicao.acao == "eleicao":
                 resposta = criar_resposta("200", "OK")
                 iniciar = True  # quem recebe pedido de eleicao tambem participa (Bully)
             elif requisicao.acao == "sincronizar":
@@ -317,6 +387,92 @@ def sincronizar_relogio():
     log(f"relogio sincronizado com {alvo} (offset {anterior:+.0f} -> {valor:+.0f} ms)")
 
 
+# ---------------------------------------------------------------- Parte 5: replicacao
+# Replicacao ativa: cada escrita aceita de um cliente (login, cadastrar, publicar) e aplicada
+# localmente e difundida no topico "replicacao|<servidor de origem>"; todos os servidores assinam
+# "replicacao|" e aplicam as escritas dos outros. Quem entra (ou volta) pede o estado completo a
+# outro servidor com "obter_estado".
+
+TOPICO_REPLICACAO = "replicacao|"
+
+
+def replicar(acao, canal, conteudo, timestamp):
+    operacao = Mensagem(
+        timestamp=timestamp, acao=acao, canal=canal, conteudo=conteudo,
+        contadorMensagem=proximo_contador(),
+    )
+    publicar_no_proxy(f"{TOPICO_REPLICACAO}{NOME_SERVIDOR}".encode(), operacao.SerializeToString())
+
+
+def aplicar_operacao(operacao):
+    """Aplica uma escrita feita por outro servidor (sem responder cliente nem republicar)."""
+    if operacao.acao == "login":
+        usuario = operacao.conteudo
+        status = "200" if usuario in usuarios["usuarios"] else "404"
+        registrar_login(usuario, operacao.timestamp, status)
+    elif operacao.acao == "cadastrar":
+        registrar_canal(operacao.conteudo)
+    elif operacao.acao == "publicar":
+        registrar_publicacao(operacao.canal, operacao.conteudo, operacao.timestamp)
+
+
+def ouvir_replicacao(pronto):
+    sub = contexto.socket(zmq.SUB)
+    sub.connect(f"tcp://{PROXY_HOST}:5558")
+    sub.setsockopt(zmq.SUBSCRIBE, TOPICO_REPLICACAO.encode())
+    pronto.set()
+    proprio = f"{TOPICO_REPLICACAO}{NOME_SERVIDOR}".encode()
+    while True:
+        topico, corpo = sub.recv_multipart()
+        if topico == proprio:
+            continue  # eco da propria escrita: ja foi aplicada
+        operacao = Mensagem()
+        operacao.ParseFromString(corpo)
+        atualizar_contador(operacao.contadorMensagem)
+        aplicar_operacao(operacao)
+        origem = topico.decode()[len(TOPICO_REPLICACAO):]
+        log(f"replicado de {origem}: {operacao.acao} {operacao.canal} {operacao.conteudo}")
+
+
+def exportar_estado():
+    with trava_dados:
+        return json.dumps({
+            "canais": canais["canais"],
+            "logins": logins,
+            "publicacoes": publicacoes,
+        }, ensure_ascii=False)
+
+
+def importar_estado(texto):
+    """Junta o estado recebido com o local (sem duplicar) e regrava os arquivos."""
+    estado = json.loads(texto)
+    with trava_dados:
+        for canal in estado.get("canais", []):
+            registrar_canal(canal)
+        for r in estado.get("logins", []):
+            registrar_login(r["usuario"], r["timestamp"], r.get("status", ""))
+        for r in estado.get("publicacoes", []):
+            registrar_publicacao(r["canal"], r["conteudo"], r["timestamp"])
+        salvar_jsonl(CAMINHO_PUBLICACOES, publicacoes)
+        return len(canais["canais"]), len(logins), len(publicacoes)
+
+
+def obter_estado_inicial():
+    """Pede o estado ao coordenador (se for outro servidor) ou ao proximo servidor da lista."""
+    with trava:
+        atual = coordenador
+    outros = [s.nome for s in listar_servidores() if s.nome != NOME_SERVIDOR]
+    candidatos = ([atual] if atual and atual != NOME_SERVIDOR else []) + [n for n in outros if n != atual]
+
+    for alvo in candidatos:
+        resposta = requisitar(f"tcp://{alvo}:{PORTA_SERVIDORES}", "obter_estado", NOME_SERVIDOR)
+        if resposta is not None and resposta.status == "200":
+            n_canais, n_logins, n_pub = importar_estado(resposta.resposta)
+            log(f"estado recebido de {alvo}: {n_canais} canais, {n_logins} logins, {n_pub} publicacoes")
+            return
+    log("nenhum outro servidor respondeu: mantendo os dados locais")
+
+
 def tratar_login(requisicao):
     usuario = requisicao.conteudo.strip()
 
@@ -325,17 +481,15 @@ def tratar_login(requisicao):
     else:
         resposta = criar_resposta("404", "Nome de usuario incorreto!")
 
-    logins.append({
-        "usuario": usuario,
-        "timestamp": requisicao.timestamp,
-        "status": resposta.status,
-    })
-    salvar_json(CAMINHO_LOGINS, logins)
+    registrar_login(usuario, requisicao.timestamp, resposta.status)
+    replicar("login", "", usuario, requisicao.timestamp)
     return resposta
 
 
 def tratar_listar(_requisicao):
-    return criar_resposta("200", "Canais listados", canais["canais"])
+    with trava_dados:
+        lista = list(canais["canais"])
+    return criar_resposta("200", "Canais listados", lista)
 
 
 def tratar_cadastrar(requisicao):
@@ -343,11 +497,10 @@ def tratar_cadastrar(requisicao):
 
     if not canal or len(canal) > 50 or "|" in canal:
         return criar_resposta("400", "Nome de canal invalido!")
-    if canal in canais["canais"]:
+    if not registrar_canal(canal):
         return criar_resposta("404", "Canal já existe!")  # mesmo codigo do servidor JS
 
-    canais["canais"].append(canal)
-    salvar_json(CAMINHO_CANAIS, canais)
+    replicar("cadastrar", "", canal, requisicao.timestamp)
     return criar_resposta("200", f"Canal {canal} cadastrado com sucesso!")
 
 
@@ -366,13 +519,8 @@ def tratar_publicar(requisicao):
     )
     publicar_no_proxy(f"{canal}|".encode(), publicacao.SerializeToString())
 
-    anexar_jsonl(CAMINHO_PUBLICACOES, {
-        "canal": canal,
-        "conteudo": texto,
-        "timestampEnvioCliente": requisicao.timestamp,
-        "timestampPublicacao": publicacao.timestampEnvio,
-        "contadorMensagem": publicacao.contadorMensagem,
-    })
+    registrar_publicacao(canal, texto, requisicao.timestamp)
+    replicar("publicar", canal, texto, requisicao.timestamp)
     return criar_resposta("200", f"Mensagem publicada no canal {canal} com sucesso!")
 
 
@@ -437,8 +585,14 @@ log(f"dados em {DIRETORIO}")
 threading.Thread(target=atender_servidores, daemon=True).start()
 threading.Thread(target=ouvir_anuncios, daemon=True).start()
 
+# Parte 5: assina a replicacao antes de pedir o estado, para nao perder escritas no meio
+replicacao_pronta = threading.Event()
+threading.Thread(target=ouvir_replicacao, args=(replicacao_pronta,), daemon=True).start()
+replicacao_pronta.wait()
+
 rank = consultar_rank()
 log(f"rank {rank}")
 
+obter_estado_inicial()
 iniciar_eleicao()
 atender_clientes()

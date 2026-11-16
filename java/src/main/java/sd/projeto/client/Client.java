@@ -1,150 +1,148 @@
 package sd.projeto.client;
 
 import org.zeromq.SocketType;
-import org.zeromq.ZMQ;
 import org.zeromq.ZContext;
-import org.zeromq.ZMQException;
-import sd.projeto.protos.Envelope;
+import org.zeromq.ZMQ;
+import sd.projeto.protos.Mensagem;
+import sd.projeto.protos.Resposta;
+import sd.projeto.protos.RespostaSub;
+
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Random;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.Set;
 
+/**
+ * Bot Java. Usa o contrato comum do grupo (proto/client.proto) e o comportamento padronizado
+ * dos bots (Parte 2): garante >= 5 canais, >= 3 inscricoes e publica 10 mensagens por rodada
+ * com 1 segundo de intervalo.
+ */
 public class Client
 {
-    // AtomicLong porque a thread receptora e a principal mexem no relogio ao mesmo tempo
-    private static final AtomicLong relogio = new AtomicLong(0);
+    private static final int MIN_CANAIS = 5;
+    private static final int MIN_INSCRICOES = 3;
+    private static final int MENSAGENS_POR_RODADA = 10;
+    private static final long INTERVALO_MS = 1000;
+
+    // o primeiro nome nao existe de proposito, para exercitar a repeticao do login
+    private static final List<String> USUARIOS = List.of(
+        "Felipe", "teste", "teste2", "teste3", "teste4", "teste5", "teste6", "teste7", "teste8", "teste9", "teste10");
+
+    private static int relogio = 0;  // relogio logico (so a thread principal usa)
+    private static ZMQ.Socket requester;
+    private static ZMQ.Socket sub;
+    private static final Random random = new Random();
 
     public static void main(String[] args) throws Exception
     {
         try (ZContext context = new ZContext()) {
-
-            ZMQ.Socket socket = context.createSocket(SocketType.REQ);
-            socket.connect("tcp://broker:5559");
-
-            ZMQ.Socket sub = context.createSocket(SocketType.SUB);
+            requester = context.createSocket(SocketType.REQ);
+            requester.connect("tcp://broker:5559");
+            sub = context.createSocket(SocketType.SUB);
             sub.connect("tcp://proxy:5558");
+            System.out.println("[CLIENTE] Conectado no broker e no proxy...");
 
-            Random random = new Random();
+            List<String> candidatos = new ArrayList<>(USUARIOS.subList(1, USUARIOS.size()));
+            Collections.shuffle(candidatos, random);
+            candidatos.add(0, USUARIOS.get(0));
 
-            while (true) {
-
-
-                Envelope envelope = Envelope.newBuilder()
-                    .setTimestamp(System.currentTimeMillis())
-                    .setAcao("login")
-                    .setConteudo("Felipe")
-                    .setContador(relogio.incrementAndGet())
-                    .build();
-                byte[] data = envelope.toByteArray();
-                socket.send(data, 0);
-
-
-                byte[] reply = socket.recv(0);
-
-                Envelope resposta = Envelope.parseFrom(reply);
-                atualizarRelogio(resposta.getContador());
-
-                if (resposta.getConteudo().startsWith("sucesso")){
-                    System.out.println("[CLIENTE] Login realizado com sucesso");
+            String usuario = null;
+            for (String candidato : candidatos) {
+                Resposta r = requisitar("login", "", candidato);
+                if (r.getStatus().equals("200")) {
+                    usuario = candidato;
+                    System.out.println("[" + usuario + "] " + r.getResposta());
                     break;
-                }else {
-                    System.out.println("[CLIENTE] Erro no login, repetindo o login...");
                 }
+                System.out.println("[" + candidato + "] Erro " + r.getStatus() + ": " + r.getResposta()
+                    + " - repetindo o login");
+            }
+            if (usuario == null) {
+                System.out.println("[CLIENTE] Nenhum usuario da lista funcionou.");
+                System.exit(1);
             }
 
-            List<String> canais = listarCanais(socket);
-            if (canais.size() < 5) {
-                String novoCanal = "canal" + random.nextInt(10000);
-                Envelope criado = enviar(socket, "criar_canal", novoCanal);
-                System.out.println("[CLIENTE] Criar canal " + novoCanal + ": " + criado.getConteudo());
-                canais = listarCanais(socket);
-            }
+            Set<String> inscritos = new HashSet<>();
+            while (true) {
+                List<String> canais = requisitar("listar", "", "").getCanaisList();
 
-            List<String> inscritos = new ArrayList<>();
-            while (inscritos.size() < 3 && inscritos.size() < canais.size()) {
-                String sorteado = canais.get(random.nextInt(canais.size()));
-                if (!inscritos.contains(sorteado)) {
-                    sub.subscribe(sorteado + "|");
-                    inscritos.add(sorteado);
-                    System.out.println("[CLIENTE] Inscrito no canal " + sorteado);
+                if (canais.size() < MIN_CANAIS) {
+                    String novo = "canal" + (1000 + random.nextInt(9000));
+                    Resposta r = requisitar("cadastrar", "", novo);
+                    System.out.println("[" + usuario + "] criar " + novo + ": " + r.getStatus() + " " + r.getResposta());
+                    canais = requisitar("listar", "", "").getCanaisList();
                 }
-            }
-            Thread.sleep(1000);
 
-            Thread receptor = new Thread(() -> {
-                while (true) {
-                    try {
-                        String topico = sub.recvStr();
-                        byte[] corpo = sub.recv(0);
-
-                        Envelope pub = Envelope.parseFrom(corpo);
-                        atualizarRelogio(pub.getContador());
-                        String[] partes = pub.getConteudo().split(",", 2);
-
-                        System.out.println(
-                            "[CLIENTE] Canal: " + partes[0] + " | Mensagem: " + partes[1]
-                            + " | Envio: " + pub.getTimestamp()
-                            + " | Recebimento: " + System.currentTimeMillis()
-                            + " | Relogio: " + pub.getContador()
-                        );
-                    } catch (ZMQException e) {
-                        break;
-                    } catch (Exception e) {
-                        e.printStackTrace();
+                if (inscritos.size() < MIN_INSCRICOES) {
+                    List<String> disponiveis = new ArrayList<>();
+                    for (String c : canais) {
+                        if (!inscritos.contains(c)) {
+                            disponiveis.add(c);
+                        }
+                    }
+                    if (!disponiveis.isEmpty()) {
+                        String escolhido = disponiveis.get(random.nextInt(disponiveis.size()));
+                        sub.subscribe((escolhido + "|").getBytes(StandardCharsets.UTF_8));
+                        inscritos.add(escolhido);
+                        System.out.println("[" + usuario + "] inscrito no " + escolhido);
                     }
                 }
-            });
-            receptor.setDaemon(true);
-            receptor.start();
 
-            while (true) {
-                canais = listarCanais(socket);
                 if (canais.isEmpty()) {
-                    Thread.sleep(1000);
+                    esperar(INTERVALO_MS);
                     continue;
                 }
 
                 String canal = canais.get(random.nextInt(canais.size()));
-                for (int i = 1; i <= 10; i++) {
-                    String mensagem = "msg" + random.nextInt(100000);
-                    Envelope r = enviar(socket, "publicar", canal + "," + mensagem);
-                    System.out.println("[CLIENTE] Publicou em " + canal + ": " + r.getConteudo());
-                    Thread.sleep(1000);
+                for (int i = 1; i <= MENSAGENS_POR_RODADA; i++) {
+                    String texto = usuario + ": msg" + random.nextInt(100000) + " (" + i + "/" + MENSAGENS_POR_RODADA + ")";
+                    Resposta r = requisitar("publicar", canal, texto);
+                    if (!r.getStatus().equals("200")) {
+                        System.out.println("[" + usuario + "] erro ao publicar em " + canal + ": "
+                            + r.getStatus() + " " + r.getResposta());
+                    }
+                    esperar(INTERVALO_MS);
                 }
             }
         }
     }
 
-    private static Envelope enviar(ZMQ.Socket socket, String acao, String conteudo) throws Exception
+    private static Resposta requisitar(String acao, String canal, String conteudo) throws Exception
     {
-        Envelope envelope = Envelope.newBuilder()
+        Mensagem mensagem = Mensagem.newBuilder()
             .setTimestamp(System.currentTimeMillis())
             .setAcao(acao)
+            .setCanal(canal)
             .setConteudo(conteudo)
-            .setContador(relogio.incrementAndGet())
+            .setContadorMensagem(++relogio)
             .build();
-        socket.send(envelope.toByteArray(), 0);
+        requester.send(mensagem.toByteArray(), 0);
 
-        byte[] reply = socket.recv(0);
-        Envelope resposta = Envelope.parseFrom(reply);
-        atualizarRelogio(resposta.getContador());
+        Resposta resposta = Resposta.parseFrom(requester.recv(0));
+        relogio = Math.max(relogio, resposta.getContadorMensagem());
         return resposta;
     }
 
-    private static void atualizarRelogio(long recebido)
+    // espera o intervalo mostrando as publicacoes que chegarem nesse tempo
+    private static void esperar(long ms) throws Exception
     {
-        relogio.updateAndGet(atual -> Math.max(atual, recebido));
-    }
-
-    private static List<String> listarCanais(ZMQ.Socket socket) throws Exception
-    {
-        Envelope r = enviar(socket, "listar_canais", "");
-        List<String> canais = new ArrayList<>();
-        if (!r.getConteudo().isBlank()) {
-            canais.addAll(Arrays.asList(r.getConteudo().split(",")));
+        long fim = System.currentTimeMillis() + ms;
+        long restante;
+        while ((restante = fim - System.currentTimeMillis()) > 0) {
+            sub.setReceiveTimeOut((int) restante);
+            String topico = sub.recvStr();
+            if (topico == null) {
+                continue;
+            }
+            RespostaSub pub = RespostaSub.parseFrom(sub.recv(0));
+            relogio = Math.max(relogio, pub.getContadorMensagem());
+            System.out.println("[CLIENTE] Canal: " + pub.getCanal() + " | Mensagem: " + pub.getConteudo()
+                + " | Envio: " + (long) pub.getTimestampEnvio()
+                + " | Recebimento: " + System.currentTimeMillis()
+                + " | Relogio: " + pub.getContadorMensagem());
         }
-        return canais;
     }
 }

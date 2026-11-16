@@ -17,7 +17,7 @@ var tempoLimite = TimeSpan.FromSeconds(3);
 
 #region Dados
 
-var diretorio = Path.Combine("dados", nome);
+var diretorio = Path.Combine(Environment.GetEnvironmentVariable("DADOS_DIR") ?? "dados", nome);
 Directory.CreateDirectory(diretorio);
 var caminhoUsuarios = Path.Combine(diretorio, "usuarios.json");
 var caminhoCanais = Path.Combine(diretorio, "canais.json");
@@ -33,10 +33,52 @@ var canais = File.Exists(caminhoCanais)
 var logins = File.Exists(caminhoLogins)
     ? JsonSerializer.Deserialize<List<LoginEntrada>>(File.ReadAllText(caminhoLogins))!
     : [];
+var publicacoes = File.Exists(caminhoPublicacoes)
+    ? File.ReadLines(caminhoPublicacoes).Where(l => l.Trim() != "")
+        .Select(l => JsonSerializer.Deserialize<PublicacaoEntrada>(l)!).ToList()
+    : new List<PublicacaoEntrada>();
 
 void AnexarLinha(string caminho, object registro)
 {
     File.AppendAllText(caminho, JsonSerializer.Serialize(registro) + "\n");
+}
+
+// Parte 5: os dados tambem sao alterados pela thread de replicacao
+var travaDados = new object();
+// chaves do que ja esta guardado: aplicar a mesma operacao duas vezes nao duplica o registro
+var loginsVistos = logins.Select(l => (l.Usuario, l.Timestamp)).ToHashSet();
+var publicacoesVistas = publicacoes.Select(p => (p.Canal, p.Conteudo, p.Timestamp)).ToHashSet();
+
+void RegistrarLogin(string usuario, double timestamp, string status)
+{
+    lock (travaDados)
+    {
+        if (!loginsVistos.Add((usuario, timestamp))) return;
+        logins.Add(new LoginEntrada { Usuario = usuario, Timestamp = timestamp, Status = status });
+        File.WriteAllText(caminhoLogins, JsonSerializer.Serialize(logins));
+    }
+}
+
+bool RegistrarCanal(string canal)
+{
+    lock (travaDados)
+    {
+        if (canais.Canais.Contains(canal)) return false;
+        canais.Canais.Add(canal);
+        File.WriteAllText(caminhoCanais, JsonSerializer.Serialize(canais));
+        return true;
+    }
+}
+
+void RegistrarPublicacao(string canal, string conteudo, double timestamp)
+{
+    lock (travaDados)
+    {
+        if (!publicacoesVistas.Add((canal, conteudo, timestamp))) return;
+        var registro = new PublicacaoEntrada { Canal = canal, Conteudo = conteudo, Timestamp = timestamp };
+        publicacoes.Add(registro);
+        AnexarLinha(caminhoPublicacoes, registro);
+    }
 }
 
 #endregion
@@ -113,9 +155,18 @@ byte[]? Requisitar(string url, string acao, string conteudo = "")
 
     using var requester = new RequestSocket();
     requester.Options.Linger = TimeSpan.Zero;
-    requester.Connect(url);
-    if (!requester.TrySendFrame(tempoLimite, mensagem.ToByteArray())) return null;
-    return requester.TryReceiveFrameBytes(tempoLimite, out var dados) ? dados : null;
+    try
+    {
+        // o Connect resolve o nome na hora e lanca excecao se o servidor caiu (nome sumiu do DNS)
+        requester.Connect(url);
+        if (!requester.TrySendFrame(tempoLimite, mensagem.ToByteArray())) return null;
+        return requester.TryReceiveFrameBytes(tempoLimite, out var dados) ? dados : null;
+    }
+    catch (Exception erro)
+    {
+        Log($"sem resposta de {url}: {erro.Message}");
+        return null;
+    }
 }
 
 Resposta? RequisitarServidor(string alvo, string acao, string conteudo = "")
@@ -265,6 +316,120 @@ void OuvirAnuncios()
 
 #endregion
 
+#region Replicacao (Parte 5)
+
+// Replicacao ativa: cada escrita aceita de um cliente (login, cadastrar, publicar) e aplicada
+// localmente e difundida no topico "replicacao|<servidor de origem>"; todos os servidores assinam
+// "replicacao|" e aplicam as escritas dos outros. Quem entra (ou volta) pede o estado completo a
+// outro servidor com "obter_estado".
+
+const string topicoReplicacao = "replicacao|";
+
+void Replicar(string acao, string canal, string conteudo, double timestamp)
+{
+    var operacao = new Mensagem
+    {
+        Timestamp = timestamp,
+        Acao = acao,
+        Canal = canal,
+        Conteudo = conteudo,
+        ContadorMensagem = ProximoContador(),
+    };
+    lock (trava)
+    {
+        publicador.SendMoreFrame(topicoReplicacao + nome).SendFrame(operacao.ToByteArray());
+    }
+}
+
+void AplicarOperacao(Mensagem operacao)
+{
+    switch (operacao.Acao)
+    {
+        case "login":
+            var status = usuarios.Usuarios.Contains(operacao.Conteudo) ? "200" : "404";
+            RegistrarLogin(operacao.Conteudo, operacao.Timestamp, status);
+            break;
+        case "cadastrar":
+            RegistrarCanal(operacao.Conteudo);
+            break;
+        case "publicar":
+            RegistrarPublicacao(operacao.Canal, operacao.Conteudo, operacao.Timestamp);
+            break;
+    }
+}
+
+void OuvirReplicacao(ManualResetEventSlim pronto)
+{
+    using var sub = new SubscriberSocket();
+    sub.Connect("tcp://proxy:5558");
+    sub.Subscribe(topicoReplicacao);
+    pronto.Set();
+
+    while (true)
+    {
+        var topico = sub.ReceiveFrameString();
+        var corpo = sub.ReceiveFrameBytes();
+        if (topico == topicoReplicacao + nome) continue; // eco da propria escrita
+
+        var operacao = Mensagem.Parser.ParseFrom(corpo);
+        AtualizarContador(operacao.ContadorMensagem);
+        AplicarOperacao(operacao);
+        Log($"replicado de {topico[topicoReplicacao.Length..]}: {operacao.Acao} {operacao.Canal} {operacao.Conteudo}");
+    }
+}
+
+string ExportarEstado()
+{
+    lock (travaDados)
+    {
+        return JsonSerializer.Serialize(new EstadoServidor
+        {
+            Canais = canais.Canais,
+            Logins = logins,
+            Publicacoes = publicacoes,
+        });
+    }
+}
+
+void ImportarEstado(string texto, string origem)
+{
+    var estado = JsonSerializer.Deserialize<EstadoServidor>(texto)!;
+    lock (travaDados)
+    {
+        foreach (var canal in estado.Canais) RegistrarCanal(canal);
+        foreach (var l in estado.Logins) RegistrarLogin(l.Usuario, l.Timestamp, l.Status);
+        foreach (var p in estado.Publicacoes) RegistrarPublicacao(p.Canal, p.Conteudo, p.Timestamp);
+        File.WriteAllLines(caminhoPublicacoes, publicacoes.Select(p => JsonSerializer.Serialize(p)));
+        Log($"estado recebido de {origem}: {canais.Canais.Count} canais, {logins.Count} logins, {publicacoes.Count} publicacoes");
+    }
+}
+
+// pede o estado ao coordenador (se for outro servidor) ou ao proximo servidor da lista
+void ObterEstadoInicial()
+{
+    string atual;
+    lock (trava) atual = coordenador;
+
+    var candidatos = new List<string>();
+    if (atual != "" && atual != nome) candidatos.Add(atual);
+    var lista = RequisitarReferencia("listar_servidores");
+    if (lista != null)
+        candidatos.AddRange(lista.Servidores.Select(s => s.Nome).Where(n => n != nome && n != atual));
+
+    foreach (var alvo in candidatos)
+    {
+        var resposta = RequisitarServidor(alvo, "obter_estado", nome);
+        if (resposta is { Status: "200" })
+        {
+            ImportarEstado(resposta.Resposta_, alvo);
+            return;
+        }
+    }
+    Log("nenhum outro servidor respondeu: mantendo os dados locais");
+}
+
+#endregion
+
 #region Servidor para servidor
 
 void AtenderServidores()
@@ -279,7 +444,12 @@ void AtenderServidores()
 
         var iniciar = false;
         Resposta resposta;
-        if (requisicao.Acao == "eleicao")
+        if (requisicao.Acao == "obter_estado") // Parte 5: transferencia de estado
+        {
+            resposta = CriarResposta("200", ExportarEstado());
+            Log($"estado enviado para {requisicao.Conteudo}");
+        }
+        else if (requisicao.Acao == "eleicao")
         {
             resposta = CriarResposta("200", "OK");
             iniciar = true;
@@ -345,9 +515,16 @@ Resposta TratarLogin(Mensagem requisicao)
         ? CriarResposta("200", "Login realizado com sucesso!")
         : CriarResposta("404", "Nome de usuario incorreto!");
 
-    logins.Add(new LoginEntrada { Usuario = usuario, Timestamp = requisicao.Timestamp, Status = resposta.Status });
-    File.WriteAllText(caminhoLogins, JsonSerializer.Serialize(logins));
+    RegistrarLogin(usuario, requisicao.Timestamp, resposta.Status);
+    Replicar("login", "", usuario, requisicao.Timestamp);
     return resposta;
+}
+
+Resposta TratarListar()
+{
+    List<string> lista;
+    lock (travaDados) lista = [.. canais.Canais];
+    return CriarResposta("200", "Canais listados", lista);
 }
 
 Resposta TratarCadastrar(Mensagem requisicao)
@@ -355,11 +532,10 @@ Resposta TratarCadastrar(Mensagem requisicao)
     var canal = requisicao.Conteudo.Trim();
     if (canal == "" || canal.Length > 50 || canal.Contains('|'))
         return CriarResposta("400", "Nome de canal invalido!");
-    if (canais.Canais.Contains(canal))
+    if (!RegistrarCanal(canal))
         return CriarResposta("404", "Canal já existe!");
 
-    canais.Canais.Add(canal);
-    File.WriteAllText(caminhoCanais, JsonSerializer.Serialize(canais));
+    Replicar("cadastrar", "", canal, requisicao.Timestamp);
     return CriarResposta("200", $"Canal {canal} cadastrado com sucesso!");
 }
 
@@ -378,14 +554,8 @@ Resposta TratarPublicar(Mensagem requisicao)
     };
     Publicar($"{canal}|", publicacao);
 
-    AnexarLinha(caminhoPublicacoes, new
-    {
-        canal,
-        conteudo = publicacao.Conteudo,
-        timestampEnvioCliente = requisicao.Timestamp,
-        timestampPublicacao = publicacao.TimestampEnvio,
-        contadorMensagem = publicacao.ContadorMensagem,
-    });
+    RegistrarPublicacao(canal, requisicao.Conteudo, requisicao.Timestamp);
+    Replicar("publicar", canal, requisicao.Conteudo, requisicao.Timestamp);
     return CriarResposta("200", $"Mensagem publicada no canal {canal} com sucesso!");
 }
 
@@ -409,7 +579,7 @@ void AtenderClientes()
             resposta = requisicao.Acao switch
             {
                 "login" => TratarLogin(requisicao),
-                "listar" => CriarResposta("200", "Canais listados", canais.Canais),
+                "listar" => TratarListar(),
                 "cadastrar" => TratarCadastrar(requisicao),
                 "publicar" => TratarPublicar(requisicao),
                 _ => CriarResposta("400", "Acao desconhecida!"),
@@ -444,6 +614,11 @@ Log($"dados em {diretorio}");
 new Thread(AtenderServidores) { IsBackground = true }.Start();
 new Thread(OuvirAnuncios) { IsBackground = true }.Start();
 
+// Parte 5: assina a replicacao antes de pedir o estado, para nao perder escritas no meio
+var replicacaoPronta = new ManualResetEventSlim(false);
+new Thread(() => OuvirReplicacao(replicacaoPronta)) { IsBackground = true }.Start();
+replicacaoPronta.Wait();
+
 int? rankInicial;
 while ((rankInicial = TentarRank()) == null)
 {
@@ -453,6 +628,7 @@ while ((rankInicial = TentarRank()) == null)
 lock (trava) rank = rankInicial.Value;
 Log($"rank {rank}");
 
+ObterEstadoInicial();
 IniciarEleicao();
 AtenderClientes();
 

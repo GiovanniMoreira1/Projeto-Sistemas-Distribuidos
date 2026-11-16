@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -21,17 +22,122 @@ struct CanaisData {
     canais: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct LoginRegistro {
     usuario: String,
     timestamp: f64,
+    #[serde(default)]
     status: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct PublicacaoRegistro {
-    conteudo: String,
     canal: String,
+    conteudo: String,
+    #[serde(default)]
+    timestamp: f64,
+}
+
+/// Estado completo trocado na transferencia de estado entre servidores (Parte 5).
+#[derive(Serialize, Deserialize, Default)]
+struct EstadoServidor {
+    #[serde(default)]
+    canais: Vec<String>,
+    #[serde(default)]
+    logins: Vec<LoginRegistro>,
+    #[serde(default)]
+    publicacoes: Vec<PublicacaoRegistro>,
+}
+
+/// Dados persistidos do servidor. Ficam num Mutex porque, a partir da Parte 5, tambem sao
+/// alterados pela thread de replicacao e lidos por quem pede a transferencia de estado.
+struct Dados {
+    arquivos: Arquivos,
+    usuarios: UsuariosData,
+    canais: CanaisData,
+    logins: Vec<LoginRegistro>,
+    publicacoes: Vec<PublicacaoRegistro>,
+    // chaves do que ja esta guardado: aplicar a mesma operacao duas vezes nao duplica o registro
+    logins_vistos: HashSet<(String, u64)>,
+    publicacoes_vistas: HashSet<(String, String, u64)>,
+}
+
+impl Dados {
+    fn carregar(arquivos: Arquivos) -> Dados {
+        let usuarios: UsuariosData = ler_json("usuarios.json", UsuariosData { usuarios: Vec::new() });
+        let canais: CanaisData = ler_json(&arquivos.canais, CanaisData { canais: Vec::new() });
+        let logins: Vec<LoginRegistro> = ler_json(&arquivos.logins, Vec::new());
+        let publicacoes: Vec<PublicacaoRegistro> = ler_json(&arquivos.publicacoes, Vec::new());
+        let logins_vistos = logins.iter().map(|l| (l.usuario.clone(), l.timestamp.to_bits())).collect();
+        let publicacoes_vistas = publicacoes
+            .iter()
+            .map(|p| (p.canal.clone(), p.conteudo.clone(), p.timestamp.to_bits()))
+            .collect();
+        Dados { arquivos, usuarios, canais, logins, publicacoes, logins_vistos, publicacoes_vistas }
+    }
+
+    fn status_login(&self, usuario: &str) -> &'static str {
+        if self.usuarios.usuarios.iter().any(|u| u == usuario) { "200" } else { "404" }
+    }
+
+    fn registrar_login(&mut self, usuario: &str, timestamp: f64, status: &str) {
+        if !self.logins_vistos.insert((usuario.to_string(), timestamp.to_bits())) {
+            return;
+        }
+        self.logins.push(LoginRegistro {
+            usuario: usuario.to_string(),
+            timestamp,
+            status: status.to_string(),
+        });
+        salvar_json(&self.arquivos.logins, &self.logins);
+    }
+
+    /// Devolve false se o canal ja existia.
+    fn registrar_canal(&mut self, canal: &str) -> bool {
+        if self.canais.canais.iter().any(|c| c == canal) {
+            return false;
+        }
+        self.canais.canais.push(canal.to_string());
+        salvar_json(&self.arquivos.canais, &self.canais);
+        true
+    }
+
+    fn registrar_publicacao(&mut self, canal: &str, conteudo: &str, timestamp: f64) {
+        let chave = (canal.to_string(), conteudo.to_string(), timestamp.to_bits());
+        if !self.publicacoes_vistas.insert(chave) {
+            return;
+        }
+        self.publicacoes.push(PublicacaoRegistro {
+            canal: canal.to_string(),
+            conteudo: conteudo.to_string(),
+            timestamp,
+        });
+        salvar_json(&self.arquivos.publicacoes, &self.publicacoes);
+    }
+
+    fn exportar(&self) -> String {
+        let estado = EstadoServidor {
+            canais: self.canais.canais.clone(),
+            logins: self.logins.clone(),
+            publicacoes: self.publicacoes.clone(),
+        };
+        serde_json::to_string(&estado).unwrap_or_default()
+    }
+
+    /// Junta o estado recebido com o local (sem duplicar).
+    fn importar(&mut self, texto: &str) -> Result<(), serde_json::Error> {
+        let estado: EstadoServidor = serde_json::from_str(texto)?;
+        for canal in &estado.canais {
+            self.registrar_canal(canal);
+        }
+        for l in &estado.logins {
+            self.registrar_login(&l.usuario, l.timestamp, &l.status);
+        }
+        for p in &estado.publicacoes {
+            self.registrar_publicacao(&p.canal, &p.conteudo, p.timestamp);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -89,14 +195,41 @@ impl Estado {
     }
 }
 
-fn ler_json<T: for<'de> Deserialize<'de>>(caminho: &str) -> T {
-    let conteudo = fs::read_to_string(caminho).expect("falha ao ler arquivo json");
-    serde_json::from_str(&conteudo).expect("falha ao parsear json")
+/// Le um json do disco; se o arquivo ainda nao existir (servidor novo), usa o valor padrao.
+fn ler_json<T: for<'de> Deserialize<'de>>(caminho: &str, padrao: T) -> T {
+    match fs::read_to_string(caminho) {
+        Ok(conteudo) => serde_json::from_str(&conteudo).expect("falha ao parsear json"),
+        Err(_) => padrao,
+    }
 }
 
 fn salvar_json<T: Serialize>(caminho: &str, dados: &T) {
     let texto = serde_json::to_string(dados).expect("falha ao serializar json");
     fs::write(caminho, texto).expect("falha ao salvar arquivo json");
+}
+
+/// Caminhos dos arquivos deste servidor: cada servidor tem o seu proprio diretorio
+/// (DADOS_DIR/NOME_SERVIDOR), nada e compartilhado entre servidores.
+struct Arquivos {
+    canais: String,
+    logins: String,
+    publicacoes: String,
+    mensagens: String,
+}
+
+impl Arquivos {
+    fn new(nome_servidor: &str) -> Arquivos {
+        let base = std::env::var("DADOS_DIR").unwrap_or_else(|_| "dados".to_string());
+        let dir = std::path::Path::new(&base).join(nome_servidor);
+        fs::create_dir_all(&dir).expect("falha ao criar diretorio de dados");
+        let caminho = |nome: &str| dir.join(nome).to_string_lossy().into_owned();
+        Arquivos {
+            canais: caminho("canais.json"),
+            logins: caminho("login.json"),
+            publicacoes: caminho("publicacoes.json"),
+            mensagens: caminho("mensagens.json"),
+        }
+    }
 }
 
 fn requisitar<R: prost::Message + Default>(
@@ -301,6 +434,7 @@ fn atender_servidores(
     socket: zmq::Socket,
     pub_sock: Arc<Mutex<zmq::Socket>>,
     estado: Arc<Mutex<Estado>>,
+    dados: Arc<Mutex<Dados>>,
 ) {
     loop {
         let request = match socket.recv_bytes(0) {
@@ -313,12 +447,23 @@ fn atender_servidores(
 
         let payload = match Mensagem::decode(request.as_slice()) {
             Ok(objeto) => {
+                // Parte 5: transferencia de estado (exportado antes de travar o Estado)
+                let estado_exportado = if objeto.acao == "obter_estado" {
+                    Some(dados.lock().unwrap().exportar())
+                } else {
+                    None
+                };
+
                 let mut iniciar = false;
                 let resp = {
                     let mut st = estado.lock().unwrap();
                     st.atualizar_contador(objeto.contador_mensagem);
 
                     match objeto.acao.as_str() {
+                        "obter_estado" => {
+                            println!("Estado enviado para {}", objeto.conteudo);
+                            st.criar_resposta("200", &estado_exportado.unwrap_or_default(), Vec::new())
+                        }
                         "eleicao" => {
                             iniciar = true;
                             st.criar_resposta("200", "OK", Vec::new())
@@ -437,71 +582,214 @@ fn heartbeat(referencia: &zmq::Socket, estado: &Arc<Mutex<Estado>>) {
             if objeto.status == "200" {
                 println!("Heartbeat confirmado.");
             } else {
+                // a referencia removeu este servidor (ficou muito tempo sem heartbeat): cadastra de novo
                 println!("Erro no heartbeat: {}", objeto.resposta);
+                if let Ok(rank) = consultar_rank(referencia, estado) {
+                    estado.lock().unwrap().rank_servidor = rank;
+                    println!("Recadastrado na referência, rank {rank}");
+                }
             }
         }
     }
 }
 
+/// Publica uma vez no canal (topico "<canal>|"); o bot e quem manda 10 mensagens por rodada.
 fn publicar(
     pub_sock: &Arc<Mutex<zmq::Socket>>,
     estado: &Arc<Mutex<Estado>>,
-    canal: &str,
-    conteudo: &str,
-    publicacoes: &mut Vec<PublicacaoRegistro>,
+    dados: &Arc<Mutex<Dados>>,
+    req: &Mensagem,
 ) -> zmq::Result<()> {
-    for _ in 1..=10 {
-        let payload_sub = {
-            let mut st = estado.lock().unwrap();
-            let contador = st.proximo_contador();
-            RespostaSub {
-                timestamp_envio: st.timestamp_ajustado(),
-                canal: canal.to_string(),
-                conteudo: conteudo.to_string(),
-                timestamp_recebimento: 0.0,
-                contador_mensagem: contador,
-            }
-        };
+    let payload_sub = {
+        let mut st = estado.lock().unwrap();
+        let contador = st.proximo_contador();
+        RespostaSub {
+            timestamp_envio: st.timestamp_ajustado(),
+            canal: req.canal.clone(),
+            conteudo: req.conteudo.clone(),
+            timestamp_recebimento: 0.0,
+            contador_mensagem: contador,
+        }
+    };
 
-        let topico = format!("{canal}|");
-        pub_sock
-            .lock()
-            .unwrap()
-            .send_multipart([topico.as_bytes(), &payload_sub.encode_to_vec()], 0)?;
+    let topico = format!("{}|", req.canal);
+    pub_sock
+        .lock()
+        .unwrap()
+        .send_multipart([topico.as_bytes(), &payload_sub.encode_to_vec()], 0)?;
 
-        publicacoes.push(PublicacaoRegistro {
-            conteudo: conteudo.to_string(),
-            canal: canal.to_string(),
-        });
-        salvar_json("publicacoes.json", publicacoes);
+    dados
+        .lock()
+        .unwrap()
+        .registrar_publicacao(&req.canal, &req.conteudo, req.timestamp);
+    replicar(pub_sock, estado, "publicar", &req.canal, &req.conteudo, req.timestamp);
 
-        println!("Mensagem publicada: {conteudo}");
-        thread::sleep(Duration::from_millis(100));
-    }
-
+    println!("Mensagem publicada: {}", req.conteudo);
     Ok(())
 }
 
-fn main() -> zmq::Result<()> {
-    let usuarios: UsuariosData = ler_json("usuarios.json");
-    let mut canais: CanaisData = ler_json("canais.json");
-    let mut logins: Vec<LoginRegistro> = ler_json("login.json");
-    let mut publicacoes: Vec<PublicacaoRegistro> = ler_json("publicacoes.json");
-    let mut mensagens: Vec<MensagemRegistro> = ler_json("mensagens.json");
+// ---------------------------------------------------------------- Parte 5: replicacao
+// Replicacao ativa: cada escrita aceita de um cliente (login, cadastrar, publicar) e aplicada
+// localmente e difundida no topico "replicacao|<servidor de origem>"; todos os servidores assinam
+// "replicacao|" e aplicam as escritas dos outros. Quem entra (ou volta) pede o estado completo a
+// outro servidor com "obter_estado".
 
+const TOPICO_REPLICACAO: &str = "replicacao|";
+
+fn replicar(
+    pub_sock: &Arc<Mutex<zmq::Socket>>,
+    estado: &Arc<Mutex<Estado>>,
+    acao: &str,
+    canal: &str,
+    conteudo: &str,
+    timestamp: f64,
+) {
+    let (topico, operacao) = {
+        let mut st = estado.lock().unwrap();
+        let contador = st.proximo_contador();
+        (
+            format!("{TOPICO_REPLICACAO}{}", st.nome_servidor),
+            Mensagem {
+                timestamp,
+                acao: acao.to_string(),
+                canal: canal.to_string(),
+                conteudo: conteudo.to_string(),
+                contador_mensagem: contador,
+            },
+        )
+    };
+
+    let sock = pub_sock.lock().unwrap();
+    if let Err(err) = sock.send_multipart([topico.as_bytes(), &operacao.encode_to_vec()], 0) {
+        println!("Erro ao replicar: {err}");
+    }
+}
+
+/// Aplica uma escrita feita por outro servidor (sem responder cliente nem republicar no canal).
+fn aplicar_operacao(dados: &Arc<Mutex<Dados>>, operacao: &Mensagem) {
+    let mut d = dados.lock().unwrap();
+    match operacao.acao.as_str() {
+        "login" => {
+            let status = d.status_login(&operacao.conteudo);
+            d.registrar_login(&operacao.conteudo, operacao.timestamp, status);
+        }
+        "cadastrar" => {
+            d.registrar_canal(&operacao.conteudo);
+        }
+        "publicar" => d.registrar_publicacao(&operacao.canal, &operacao.conteudo, operacao.timestamp),
+        _ => {}
+    }
+}
+
+fn ouvir_replicacao(sub: zmq::Socket, estado: Arc<Mutex<Estado>>, dados: Arc<Mutex<Dados>>) {
+    let proprio = format!("{TOPICO_REPLICACAO}{}", estado.lock().unwrap().nome_servidor);
+    loop {
+        let frames = match sub.recv_multipart(0) {
+            Ok(frames) if frames.len() >= 2 => frames,
+            Ok(_) => continue,
+            Err(err) => {
+                println!("Erro ao ouvir replicação: {err}");
+                break;
+            }
+        };
+        let topico = String::from_utf8_lossy(&frames[0]).into_owned();
+        if topico == proprio {
+            continue; // eco da propria escrita: ja foi aplicada
+        }
+        match Mensagem::decode(frames[1].as_slice()) {
+            Ok(operacao) => {
+                estado.lock().unwrap().atualizar_contador(operacao.contador_mensagem);
+                aplicar_operacao(&dados, &operacao);
+                println!(
+                    "Replicado de {}: {} {} {}",
+                    &topico[TOPICO_REPLICACAO.len()..],
+                    operacao.acao,
+                    operacao.canal,
+                    operacao.conteudo
+                );
+            }
+            Err(err) => println!("Erro ao decodificar replicação: {err}"),
+        }
+    }
+}
+
+/// Pede o estado ao coordenador (se for outro servidor) ou ao proximo servidor da lista.
+fn obter_estado_inicial(ctx: &zmq::Context, estado: &Arc<Mutex<Estado>>, dados: &Arc<Mutex<Dados>>) {
+    let (nome, atual) = {
+        let st = estado.lock().unwrap();
+        (st.nome_servidor.clone(), st.servidor_eleito.clone())
+    };
+
+    let mut candidatos = Vec::new();
+    if !atual.is_empty() && atual != nome {
+        candidatos.push(atual.clone());
+    }
+    for s in listar_servidores(ctx, estado) {
+        if s.nome != nome && s.nome != atual {
+            candidatos.push(s.nome);
+        }
+    }
+
+    for alvo in candidatos {
+        let payload = {
+            let mut st = estado.lock().unwrap();
+            let contador = st.proximo_contador();
+            Mensagem {
+                timestamp: st.timestamp_ajustado(),
+                acao: "obter_estado".to_string(),
+                canal: String::new(),
+                conteudo: nome.clone(),
+                contador_mensagem: contador,
+            }
+        };
+        let url = format!("tcp://{alvo}:{PORTA_SERVIDORES}");
+        if let Some(resposta) = requisitar::<Resposta>(ctx, &url, &payload) {
+            estado.lock().unwrap().atualizar_contador(resposta.contador_mensagem);
+            if resposta.status != "200" {
+                continue;
+            }
+            let mut d = dados.lock().unwrap();
+            match d.importar(&resposta.resposta) {
+                Ok(()) => {
+                    println!(
+                        "Estado recebido de {alvo}: {} canais, {} logins, {} publicacoes",
+                        d.canais.canais.len(),
+                        d.logins.len(),
+                        d.publicacoes.len()
+                    );
+                    return;
+                }
+                Err(err) => println!("Estado inválido recebido de {alvo}: {err}"),
+            }
+        }
+    }
+    println!("Nenhum outro servidor respondeu: mantendo os dados locais");
+}
+
+fn main() -> zmq::Result<()> {
+    // Nome do servidor = nome do servico no docker-compose: os outros servidores usam esse
+    // nome como endereco (tcp://<nome>:5559) para pedir eleicao e sincronizacao.
     let nome_servidor =
         std::env::var("NOME_SERVIDOR").unwrap_or_else(|_| "servidorRust".to_string());
+    let arquivos = Arquivos::new(&nome_servidor);
+    let caminho_mensagens = arquivos.mensagens.clone();
+    let mut mensagens: Vec<MensagemRegistro> = ler_json(&caminho_mensagens, Vec::new());
+    let dados = Arc::new(Mutex::new(Dados::carregar(arquivos)));
 
     let ctx = zmq::Context::new();
     let responder = ctx.socket(zmq::REP)?;
     let resposta_servidores = ctx.socket(zmq::REP)?;
     let pub_sock = Arc::new(Mutex::new(ctx.socket(zmq::PUB)?));
     let sub = ctx.socket(zmq::SUB)?;
+    let sub_replicacao = ctx.socket(zmq::SUB)?;
     let referencia = ctx.socket(zmq::REQ)?;
 
     pub_sock.lock().unwrap().connect("tcp://proxy:5557")?;
     sub.connect("tcp://proxy:5558")?;
     sub.set_subscribe(b"servers")?;
+    // Parte 5: assina a replicacao antes de pedir o estado, para nao perder escritas no meio
+    sub_replicacao.connect("tcp://proxy:5558")?;
+    sub_replicacao.set_subscribe(TOPICO_REPLICACAO.as_bytes())?;
     responder.connect("tcp://broker:5560")?;
     resposta_servidores.bind(&format!("tcp://*:{PORTA_SERVIDORES}"))?;
     referencia.connect("tcp://referencia:5556")?;
@@ -527,10 +815,19 @@ fn main() -> zmq::Result<()> {
     let estado_sub = Arc::clone(&estado);
     thread::spawn(move || ouvir_anuncios(sub, estado_sub));
 
+    let estado_rep = Arc::clone(&estado);
+    let dados_rep = Arc::clone(&dados);
+    thread::spawn(move || ouvir_replicacao(sub_replicacao, estado_rep, dados_rep));
+
     let ctx_srv = ctx.clone();
     let pub_srv = Arc::clone(&pub_sock);
     let estado_srv = Arc::clone(&estado);
-    thread::spawn(move || atender_servidores(ctx_srv, resposta_servidores, pub_srv, estado_srv));
+    let dados_srv = Arc::clone(&dados);
+    thread::spawn(move || {
+        atender_servidores(ctx_srv, resposta_servidores, pub_srv, estado_srv, dados_srv)
+    });
+
+    obter_estado_inicial(&ctx, &estado, &dados);
 
     let ctx_el = ctx.clone();
     let pub_el = Arc::clone(&pub_sock);
@@ -576,22 +873,22 @@ fn main() -> zmq::Result<()> {
             contador_mensagem: Some(req.contador_mensagem),
             canais: None,
         });
-        salvar_json("mensagens.json", &mensagens);
+        salvar_json(&caminho_mensagens, &mensagens);
 
         match req.acao.as_str() {
             "login" => {
-                let (status, texto) = if usuarios.usuarios.contains(&req.conteudo) {
-                    ("200", "Login realizado com sucesso!")
-                } else {
-                    ("404", "Nome de usuario incorreto!")
+                let status = {
+                    let mut d = dados.lock().unwrap();
+                    let status = d.status_login(&req.conteudo);
+                    d.registrar_login(&req.conteudo, req.timestamp, status);
+                    status
                 };
-
-                logins.push(LoginRegistro {
-                    usuario: req.conteudo.clone(),
-                    timestamp: req.timestamp,
-                    status: status.to_string(),
-                });
-                salvar_json("login.json", &logins);
+                let texto = if status == "200" {
+                    "Login realizado com sucesso!"
+                } else {
+                    "Nome de usuario incorreto!"
+                };
+                replicar(&pub_sock, &estado, "login", "", &req.conteudo, req.timestamp);
 
                 let payload = estado
                     .lock()
@@ -609,10 +906,10 @@ fn main() -> zmq::Result<()> {
                     contador_mensagem: None,
                     canais: None,
                 });
-                salvar_json("mensagens.json", &mensagens);
+                salvar_json(&caminho_mensagens, &mensagens);
             }
             "listar" => {
-                let lista = canais.canais.clone();
+                let lista = dados.lock().unwrap().canais.canais.clone();
                 let payload = estado.lock().unwrap().criar_resposta(
                     "200",
                     "Canais listados",
@@ -630,12 +927,12 @@ fn main() -> zmq::Result<()> {
                     contador_mensagem: None,
                     canais: Some(lista),
                 });
-                salvar_json("mensagens.json", &mensagens);
+                salvar_json(&caminho_mensagens, &mensagens);
             }
             "cadastrar" => {
-                let (status, texto) = if !canais.canais.contains(&req.conteudo) {
-                    canais.canais.push(req.conteudo.clone());
-                    salvar_json("canais.json", &canais);
+                let criado = dados.lock().unwrap().registrar_canal(&req.conteudo);
+                let (status, texto) = if criado {
+                    replicar(&pub_sock, &estado, "cadastrar", "", &req.conteudo, req.timestamp);
                     (
                         "200",
                         format!("Canal {} cadastrado com sucesso!", req.conteudo),
@@ -660,15 +957,14 @@ fn main() -> zmq::Result<()> {
                     contador_mensagem: None,
                     canais: None,
                 });
-                salvar_json("mensagens.json", &mensagens);
+                salvar_json(&caminho_mensagens, &mensagens);
             }
             "publicar" => {
                 let (status, texto) = match publicar(
                     &pub_sock,
                     &estado,
-                    &req.canal,
-                    &req.conteudo,
-                    &mut publicacoes,
+                    &dados,
+                    &req,
                 ) {
                     Ok(()) => (
                         "200",
@@ -696,7 +992,7 @@ fn main() -> zmq::Result<()> {
                     contador_mensagem: None,
                     canais: None,
                 });
-                salvar_json("mensagens.json", &mensagens);
+                salvar_json(&caminho_mensagens, &mensagens);
             }
             _ => {
                 let payload = estado.lock().unwrap().criar_resposta(

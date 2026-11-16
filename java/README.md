@@ -1,5 +1,12 @@
 # Canais - Partes 1 e 2 (Java)
 
+> **Nota da unificação:** para conversar com as outras linguagens, esta implementação foi adaptada ao
+> contrato comum do grupo (veja o `README.md` da raiz): passou a usar `proto/client.proto` (mensagens
+> `Mensagem`, `Resposta`, `RespostaSub`, `RespostaReferencia`) no lugar do `Envelope`, as ações
+> `listar`/`cadastrar`/`consultar_rank`/`listar_servidores`/`sincronizar`, a porta 5559 entre servidores
+> e ganhou a replicação da Parte 5. As seções abaixo descrevem a versão original da branch
+> `servidor-java` e ficam como histórico das decisões.
+
 Essa é a parte em Java do trabalho de Sistemas Distribuídos (CC7261), do Centro Universitário FEI, professor Leonardo Anjoletto Ferreira. O grupo tem 5 integrantes, cada um implementando o projeto inteiro (cliente e servidor) numa linguagem diferente, e no final todas as partes conversam entre si. Esse repositório é só a minha parte, em Java.
 
 ## O que essa parte faz

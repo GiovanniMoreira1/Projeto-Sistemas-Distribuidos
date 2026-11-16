@@ -7,7 +7,8 @@ edition = "2021"
 prost = "0.13"
 rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# float_roundtrip: le os timestamps da transferencia de estado sem perder precisao (Parte 5)
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 zmq = "0.10"
 
 [build-dependencies]

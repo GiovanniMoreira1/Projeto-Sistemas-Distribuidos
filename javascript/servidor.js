@@ -1,12 +1,240 @@
 import { Reply, Publisher, Request, Subscriber } from "zeromq";
 import fs from "fs/promises";
+import os from "os";
+import path from "path";
+import { fileURLToPath } from "url";
 import protobuf from "protobufjs";
 
-var usuarios = JSON.parse(await fs.readFile("usuarios.json", "utf-8"));
-var canais = JSON.parse(await fs.readFile("canais.json", "utf-8"));
-var logins = JSON.parse(await fs.readFile("login.json", "utf-8"));
-var publicacoes = JSON.parse(await fs.readFile("publicacoes.json", "utf-8"));
-var mensagens = JSON.parse(await fs.readFile("mensagens.json", "utf-8"));
+// Nome do servidor = nome do servico no docker-compose: os outros servidores usam esse nome
+// como endereco (tcp://<nome>:5559) para pedir eleicao e sincronizacao.
+const NOME_SERVIDOR = process.env.NOME_SERVIDOR || os.hostname();
+const PORTA_SERVIDORES = 5559;
+
+const PASTA_CODIGO = path.dirname(fileURLToPath(import.meta.url));
+const ARQUIVO_PROTO = path.join(PASTA_CODIGO, "..", "proto", "client.proto");
+
+// cada servidor tem o seu proprio diretorio de dados: nada e compartilhado entre servidores
+const DIRETORIO = path.join(process.env.DADOS_DIR || "dados", NOME_SERVIDOR);
+await fs.mkdir(DIRETORIO, { recursive: true });
+
+const ARQUIVO_CANAIS = path.join(DIRETORIO, "canais.json");
+const ARQUIVO_LOGINS = path.join(DIRETORIO, "login.json");
+const ARQUIVO_PUBLICACOES = path.join(DIRETORIO, "publicacoes.json");
+const ARQUIVO_MENSAGENS = path.join(DIRETORIO, "mensagens.json");
+
+async function lerJson(caminho, padrao) {
+    try {
+        return JSON.parse(await fs.readFile(caminho, "utf-8"));
+    } catch {
+        return padrao;
+    }
+}
+
+var usuarios = await lerJson(path.join(PASTA_CODIGO, "usuarios.json"), { usuarios: [] });
+var canais = await lerJson(ARQUIVO_CANAIS, { canais: [] });
+var logins = await lerJson(ARQUIVO_LOGINS, []);
+var publicacoes = await lerJson(ARQUIVO_PUBLICACOES, []);
+var mensagens = await lerJson(ARQUIVO_MENSAGENS, []);
+
+// os arquivos sao gravados pelo atendimento dos clientes e pela replicacao ao mesmo tempo:
+// cada arquivo tem uma fila de gravacoes para que duas escritas nao se misturem
+const filasArquivos = new Map();
+
+function salvarArquivo(caminho, dados) {
+    const texto = JSON.stringify(dados);
+    const anterior = filasArquivos.get(caminho) || Promise.resolve();
+    const proxima = anterior.catch(() => {}).then(() => fs.writeFile(caminho, texto, "utf-8"));
+    filasArquivos.set(caminho, proxima);
+    return proxima;
+}
+
+// chaves do que ja esta guardado: aplicar a mesma operacao duas vezes nao duplica o registro
+const chaveLogin = (usuario, timestamp) => JSON.stringify([usuario, Number(timestamp)]);
+const chavePublicacao = (canal, conteudo, timestamp) => JSON.stringify([canal, conteudo, Number(timestamp)]);
+const loginsVistos = new Set(logins.map(l => chaveLogin(l.usuario, l.timestamp)));
+const publicacoesVistas = new Set(publicacoes.map(p => chavePublicacao(p.canal, p.conteudo, p.timestamp)));
+
+async function registrarLogin(usuario, timestamp, status) {
+    const chave = chaveLogin(usuario, timestamp);
+    if (loginsVistos.has(chave)) {
+        return;
+    }
+    loginsVistos.add(chave);
+    logins.push({ usuario: usuario, timestamp: Number(timestamp), status: status });
+    await salvarArquivo(ARQUIVO_LOGINS, logins);
+}
+
+// devolve false se o canal ja existia
+async function registrarCanal(canal) {
+    if (canais.canais.includes(canal)) {
+        return false;
+    }
+    canais.canais.push(canal);
+    await salvarArquivo(ARQUIVO_CANAIS, canais);
+    return true;
+}
+
+async function registrarPublicacao(canal, conteudo, timestamp) {
+    const chave = chavePublicacao(canal, conteudo, timestamp);
+    if (publicacoesVistas.has(chave)) {
+        return;
+    }
+    publicacoesVistas.add(chave);
+    publicacoes.push({ canal: canal, conteudo: conteudo, timestamp: Number(timestamp) });
+    await salvarArquivo(ARQUIVO_PUBLICACOES, publicacoes);
+}
+
+// ---------------------------------------------------------------- Parte 5: replicacao
+// Replicacao ativa: cada escrita aceita de um cliente (login, cadastrar, publicar) e aplicada
+// localmente e difundida no topico "replicacao|<servidor de origem>"; todos os servidores assinam
+// "replicacao|" e aplicam as escritas dos outros. Quem entra (ou volta) pede o estado completo a
+// outro servidor com "obter_estado".
+
+const TOPICO_REPLICACAO = "replicacao|";
+var pubReplicacao = null;
+
+async function replicar(acao, canal, conteudo, timestamp) {
+
+    contadorMensagens++;
+
+    const operacao = Mensagem.create({
+        timestamp: Number(timestamp),
+        acao: acao,
+        canal: canal,
+        conteudo: conteudo,
+        contadorMensagem: contadorMensagens
+    });
+
+    await pubReplicacao.send([
+        TOPICO_REPLICACAO + NOME_SERVIDOR,
+        Mensagem.encode(operacao).finish()
+    ]);
+}
+
+// aplica uma escrita feita por outro servidor (sem responder cliente nem republicar no canal)
+async function aplicarOperacao(operacao) {
+
+    if (operacao.acao === "login") {
+        const status = usuarios.usuarios.includes(operacao.conteudo) ? "200" : "404";
+        await registrarLogin(operacao.conteudo, operacao.timestamp, status);
+    }
+
+    else if (operacao.acao === "cadastrar") {
+        await registrarCanal(operacao.conteudo);
+    }
+
+    else if (operacao.acao === "publicar") {
+        await registrarPublicacao(operacao.canal, operacao.conteudo, operacao.timestamp);
+    }
+}
+
+async function ouvirReplicacao(subReplicacao) {
+
+    for await (const [topico, msg] of subReplicacao) {
+
+        try {
+
+            const origem = topico.toString().slice(TOPICO_REPLICACAO.length);
+
+            if (origem === NOME_SERVIDOR) {
+                continue;  // eco da propria escrita: ja foi aplicada
+            }
+
+            const operacao = Mensagem.toObject(Mensagem.decode(msg), {
+                longs: Number,
+                defaults: true
+            });
+
+            contadorMensagens = Math.max(contadorMensagens, Number(operacao.contadorMensagem));
+
+            await aplicarOperacao(operacao);
+
+            console.log("Replicado de " + origem + ":", operacao.acao, operacao.canal, operacao.conteudo);
+
+        } catch (error) {
+
+            console.log("Erro ao aplicar replicação:", error);
+        }
+    }
+}
+
+function exportarEstado() {
+
+    return JSON.stringify({
+        canais: canais.canais,
+        logins: logins,
+        publicacoes: publicacoes
+    });
+}
+
+// junta o estado recebido com o local (sem duplicar)
+async function importarEstado(texto) {
+
+    const estado = JSON.parse(texto);
+
+    for (const canal of estado.canais || []) {
+        await registrarCanal(canal);
+    }
+
+    for (const l of estado.logins || []) {
+        await registrarLogin(l.usuario, l.timestamp, l.status || "");
+    }
+
+    for (const p of estado.publicacoes || []) {
+        await registrarPublicacao(p.canal, p.conteudo, p.timestamp);
+    }
+}
+
+// pede o estado ao coordenador (se for outro servidor) ou ao proximo servidor da lista
+async function obterEstadoInicial() {
+
+    const servidores = await listarServidores();
+
+    const candidatos = [];
+
+    if (servidorEleito !== "" && servidorEleito !== NOME_SERVIDOR) {
+        candidatos.push(servidorEleito);
+    }
+
+    for (const s of servidores) {
+        if (s.nome !== NOME_SERVIDOR && s.nome !== servidorEleito) {
+            candidatos.push(s.nome);
+        }
+    }
+
+    for (const alvo of candidatos) {
+
+        contadorMensagens++;
+
+        const payload = Mensagem.create({
+            timestamp: Date.now() + offsetRelogio,
+            acao: "obter_estado",
+            conteudo: NOME_SERVIDOR,
+            contadorMensagem: contadorMensagens
+        });
+
+        const objeto = await requisitar(
+            "tcp://" + alvo + ":" + PORTA_SERVIDORES,
+            payload,
+            Resposta
+        );
+
+        if (objeto !== null && objeto.status === "200") {
+
+            await importarEstado(objeto.resposta);
+
+            console.log(
+                "Estado recebido de " + alvo + ":",
+                canais.canais.length, "canais,",
+                logins.length, "logins,",
+                publicacoes.length, "publicacoes"
+            );
+            return;
+        }
+    }
+
+    console.log("Nenhum outro servidor respondeu: mantendo os dados locais");
+}
 
 var contadorMensagens = 0;
 
@@ -14,9 +242,6 @@ var mensagensRecebidas = 0;
 
 var offsetRelogio = 0;
 
-const NOME_SERVIDOR = "servidorJavaScript";
-// const NOME_SERVIDOR = process.env.NOME_SERVIDOR || "servidorJavaScript";
-const PORTA_SERVIDORES = 5559;
 const TEMPO_LIMITE_MS = 3000;
 
 var Mensagem;
@@ -33,7 +258,7 @@ var anuncioRecebido = false;
 
 async function run() {
 
-    const root = await protobuf.load("client.proto");
+    const root = await protobuf.load(ARQUIVO_PROTO);
 
     Mensagem = root.lookupType("Mensagem");
     Resposta = root.lookupType("Resposta");
@@ -44,16 +269,31 @@ async function run() {
 
     const respostaServidores = new Reply();
 
-    const pub = new Publisher();
+    const pubSocket = new Publisher();
+
+    // o PUB e usado ao mesmo tempo pelas requisicoes, pela eleicao e pela replicacao, e o
+    // zeromq.js nao aceita dois envios simultaneos no mesmo socket: os envios entram numa fila
+    let filaPub = Promise.resolve();
+    const pub = {
+        send: (frames) => (filaPub = filaPub.catch(() => {}).then(() => pubSocket.send(frames)))
+    };
 
     const sub = new Subscriber();
 
+    const subReplicacao = new Subscriber();
+
     const referencia = new Request();
 
-    pub.connect("tcp://proxy:5557");
+    pubSocket.connect("tcp://proxy:5557");
 
     sub.connect("tcp://proxy:5558");
     sub.subscribe("servers");
+
+    // Parte 5: assina a replicacao antes de pedir o estado, para nao perder escritas no meio
+    subReplicacao.connect("tcp://proxy:5558");
+    subReplicacao.subscribe(TOPICO_REPLICACAO);
+    ouvirReplicacao(subReplicacao);
+    pubReplicacao = pub;
 
     responder.connect("tcp://broker:5560");
 
@@ -75,6 +315,8 @@ async function run() {
 
     ouvirAnuncios(sub);
     atenderServidores(respostaServidores, pub);
+
+    await obterEstadoInicial();
 
     iniciarEleicao(pub);
 
@@ -121,11 +363,7 @@ async function run() {
                 contadorMensagem: objetoOriginal.contadorMensagem
             });
 
-            await fs.writeFile(
-                "mensagens.json",
-                JSON.stringify(mensagens),
-                "utf-8"
-            );
+            await salvarArquivo(ARQUIVO_MENSAGENS, mensagens);
 
             // LOGIN
             if (objetoOriginal.acao === "login") {
@@ -138,17 +376,7 @@ async function run() {
                         "Login realizado com sucesso!"
                     );
 
-                    logins.push({
-                        usuario: objetoOriginal.conteudo,
-                        timestamp: objetoOriginal.timestamp,
-                        status: "200"
-                    });
-
-                    await fs.writeFile(
-                        "login.json",
-                        JSON.stringify(logins),
-                        "utf-8"
-                    );
+                    await registrarLogin(objetoOriginal.conteudo, objetoOriginal.timestamp, "200");
 
                     await enviarResposta(responder, payload);
 
@@ -166,17 +394,7 @@ async function run() {
                         "Nome de usuario incorreto!"
                     );
 
-                    logins.push({
-                        usuario: objetoOriginal.conteudo,
-                        timestamp: objetoOriginal.timestamp,
-                        status: "404"
-                    });
-
-                    await fs.writeFile(
-                        "login.json",
-                        JSON.stringify(logins),
-                        "utf-8"
-                    );
+                    await registrarLogin(objetoOriginal.conteudo, objetoOriginal.timestamp, "404");
 
                     await enviarResposta(responder, payload);
 
@@ -186,6 +404,8 @@ async function run() {
                         conteudo: "Nome de usuario incorreto!"
                     });
                 }
+
+                await replicar("login", "", objetoOriginal.conteudo, objetoOriginal.timestamp);
 
                 await salvarMensagens();
             }
@@ -215,15 +435,9 @@ async function run() {
             // CADASTRAR CANAL
             else if (objetoOriginal.acao === "cadastrar") {
 
-                if (!canais.canais.includes(objetoOriginal.conteudo)) {
+                if (await registrarCanal(objetoOriginal.conteudo)) {
 
-                    canais.canais.push(objetoOriginal.conteudo);
-
-                    await fs.writeFile(
-                        "canais.json",
-                        JSON.stringify(canais),
-                        "utf-8"
-                    );
+                    await replicar("cadastrar", "", objetoOriginal.conteudo, objetoOriginal.timestamp);
 
                     const payload = criarResposta(
                         Resposta,
@@ -350,11 +564,7 @@ function RespostaEncode(payload) {
 // Salva histórico de mensagens
 async function salvarMensagens() {
 
-    await fs.writeFile(
-        "mensagens.json",
-        JSON.stringify(mensagens),
-        "utf-8"
-    );
+    await salvarArquivo(ARQUIVO_MENSAGENS, mensagens);
 }
 
 async function requisitar(url, payload, Tipo) {
@@ -593,7 +803,17 @@ async function atenderServidores(socket, pub) {
                 Number(objeto.contadorMensagem)
             );
 
-            if (objeto.acao === "eleicao") {
+            // Parte 5: transferencia de estado para um servidor que esta entrando
+            if (objeto.acao === "obter_estado") {
+
+                const payload = criarResposta(Resposta, "200", exportarEstado());
+
+                await enviarResposta(socket, payload);
+
+                console.log("Estado enviado para", objeto.conteudo);
+            }
+
+            else if (objeto.acao === "eleicao") {
 
                 const payload = criarResposta(Resposta, "200", "OK");
 
@@ -739,52 +959,42 @@ async function heartbeat(
 
     } else {
 
+        // a referencia removeu este servidor (ficou muito tempo sem heartbeat): cadastra de novo
         console.log("Erro no heartbeat:", objeto.resposta);
+
+        rankServidor = await consultarRank(requester, Mensagem, RespostaReferencia);
+
+        console.log("Recadastrado na referência, rank", rankServidor);
     }
 
     return objeto;
 }
 
+// publica uma vez no canal (topico "<canal>|"); o bot e quem manda 10 mensagens por rodada
 async function publicar(pub, objetoOriginal, RespostaSub) {
 
-    let contador = 1;
+    contadorMensagens++;
 
-    while (contador <= 10) {
+    const payloadSub = RespostaSub.create({
+        timestampEnvio: Date.now() + offsetRelogio,
+        canal: objetoOriginal.canal,
+        conteudo: objetoOriginal.conteudo,
+        contadorMensagem: contadorMensagens
+    });
 
-        contadorMensagens++;
+    await pub.send([
+        objetoOriginal.canal + "|",
+        RespostaSub.encode(payloadSub).finish()
+    ]);
 
-        const payloadSub = RespostaSub.create({
-            timestampEnvio: Date.now() + offsetRelogio,
-            canal: objetoOriginal.canal,
-            conteudo: objetoOriginal.conteudo,
-            contadorMensagem: contadorMensagens
-        });
+    await registrarPublicacao(objetoOriginal.canal, objetoOriginal.conteudo, objetoOriginal.timestamp);
 
-        await pub.send([
-            objetoOriginal.canal + "|",
-            RespostaSub.encode(payloadSub).finish()
-        ]);
+    await replicar("publicar", objetoOriginal.canal, objetoOriginal.conteudo, objetoOriginal.timestamp);
 
-        publicacoes.push({
-            conteudo: objetoOriginal.conteudo,
-            canal: objetoOriginal.canal
-        });
-
-        await fs.writeFile(
-            "publicacoes.json",
-            JSON.stringify(publicacoes),
-            "utf-8"
-        );
-
-        console.log(
-            "Mensagem publicada:",
-            objetoOriginal.conteudo
-        );
-
-        contador++;
-
-        await new Promise(resolve => setTimeout(resolve, 100));
-    }
+    console.log(
+        "Mensagem publicada:",
+        objetoOriginal.conteudo
+    );
 }
 
 run().catch(error => {

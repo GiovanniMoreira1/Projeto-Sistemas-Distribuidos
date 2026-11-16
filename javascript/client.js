@@ -1,32 +1,42 @@
 import { Request, Subscriber } from "zeromq";
-
+import path from "path";
+import { fileURLToPath } from "url";
 import protobuf from "protobufjs";
-  
+
+const ARQUIVO_PROTO = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "proto", "client.proto");
+
+const MIN_CANAIS = 5;
+const MIN_INSCRICOES = 3;
+const MENSAGENS_POR_RODADA = 10;
+const INTERVALO_MS = 1000;
+
 var contadorMensagem = 0;
 
+const inscritos = new Set();
+
 async function run() {
-  var usuarios = ["usuario1", "usuario2", "usuario3","teste", "usuario4", "usuario5"]
-  const root = await protobuf.load("client.proto");
+  // o primeiro nome nao existe de proposito, para exercitar a repeticao do login
+  var usuarios = ["usuario1", "usuario2", "usuario3", "teste", "teste2", "teste3", "teste4", "teste5"];
+  const root = await protobuf.load(ARQUIVO_PROTO);
 
   const Mensagem = root.lookupType("Mensagem");
   const Resposta = root.lookupType("Resposta");
   const RespostaSub = root.lookupType("RespostaSub");
 
-  console.log("Cliente conectado no broker...");
-  
   const requester = new Request();
   const subscriber = new Subscriber();
-  
+
   subscriber.connect("tcp://proxy:5558");
   requester.connect("tcp://broker:5559");
 
+  console.log("Cliente conectado no broker e no proxy...");
+
   var indiceUsuario = 0;
-  var indiceCanal = 0;
 
   var reply = await login(requester, Mensagem, Resposta, usuarios[indiceUsuario]);
 
   while (reply.status != "200") {
-    console.log("Nome de usuario incorreto!");
+    console.log(`[${usuarios[indiceUsuario]}] Erro ${reply.status}: ${reply.resposta}`);
 
     indiceUsuario++;
 
@@ -35,44 +45,48 @@ async function run() {
       requester.close();
       process.exit(1);
     }
-    
+
     reply = await login(requester, Mensagem, Resposta, usuarios[indiceUsuario]);
   }
-  
-  var canais = await listarCanais(requester, Mensagem, Resposta);
-  indiceCanal = canais.canais.length;
-  indiceCanal += 1;
-  if (canais.canais.length < 5) {
-    console.log("Erro: quantidade de canais insuficiente. É necessário ter pelo menos 5 canais cadastrados.");
-    indiceCanal += 1;
-    await cadastrarCanal(requester, Mensagem, Resposta, `canal${indiceCanal}`);
-  }
-  console.log("Canais disponiveis: " + canais.canais.join(", "));
 
-  let valores = [];
-  for (var i = 0; i < 3; i++) {
-    const aleatorio = canais.canais[Math.floor(Math.random() * canais.canais.length)];
-    
-    if (valores.includes(aleatorio)) {
-      i--;
-      continue;
-    }else{
-      valores.push(aleatorio);
-      inscreverCanal(aleatorio, subscriber);
-    }
-  }
+  const usuario = usuarios[indiceUsuario];
+  console.log(`[${usuario}] ${reply.resposta}`);
 
   receberPublicacoes(subscriber, RespostaSub).catch(console.error);
 
+  // comportamento padronizado dos bots (Parte 2)
   while (true) {
-    const aleatorio = canais.canais[Math.floor(Math.random() * canais.canais.length)];
-  
-    await publicarMensagem(requester, Mensagem, Resposta, aleatorio, `Mensagem de teste para o canal ${aleatorio}`);
+    var canais = (await listarCanais(requester, Mensagem, Resposta)).canais;
+
+    if (canais.length < MIN_CANAIS) {
+      const novo = `canal${Math.floor(1000 + Math.random() * 9000)}`;
+      const resposta = await cadastrarCanal(requester, Mensagem, Resposta, novo);
+      console.log(`[${usuario}] criar ${novo}: ${resposta.status} ${resposta.resposta}`);
+      canais = (await listarCanais(requester, Mensagem, Resposta)).canais;
+    }
+
+    if (inscritos.size < MIN_INSCRICOES) {
+      const disponiveis = canais.filter(c => !inscritos.has(c));
+      if (disponiveis.length > 0) {
+        inscreverCanal(disponiveis[Math.floor(Math.random() * disponiveis.length)], subscriber, usuario);
+      }
+    }
+
+    if (canais.length === 0) {
+      await esperar(INTERVALO_MS);
+      continue;
+    }
+
+    const canal = canais[Math.floor(Math.random() * canais.length)];
+    for (let i = 1; i <= MENSAGENS_POR_RODADA; i++) {
+      const texto = `${usuario}: mensagem de teste para o canal ${canal} (${i}/${MENSAGENS_POR_RODADA})`;
+      const resposta = await publicarMensagem(requester, Mensagem, Resposta, canal, texto);
+      if (resposta.status != "200") {
+        console.log(`[${usuario}] erro ao publicar em ${canal}: ${resposta.status} ${resposta.resposta}`);
+      }
+      await esperar(INTERVALO_MS);
+    }
   }
-
-
-  requester.close();
-  process.exit(0);
 }
 
 run();
@@ -80,6 +94,10 @@ run();
 process.on("SIGINT", function () {
   process.exit(0);
 });
+
+function esperar(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 async function login(requester, Mensagem, Resposta, usuario) {
   var timestamp = Date.now();
@@ -155,9 +173,10 @@ async function publicarMensagem(requester, Mensagem, Resposta, canal, mensagem) 
   return deserializarMensagem(Resposta, reply);
 }
 
-function inscreverCanal(canal, subscriber) {
+function inscreverCanal(canal, subscriber, usuario) {
   subscriber.subscribe(canal + "|");
-  console.log(`cliente inscrito no ${canal}`);
+  inscritos.add(canal);
+  console.log(`[${usuario}] inscrito no ${canal}`);
 }
 
 
@@ -172,6 +191,6 @@ async function receberPublicacoes(subscriber, RespostaSub) {
       contadorMensagem: dados.contadorMensagem
     });
 
-    contadorMensagem = Math.max(contadorMensagem, Number(dados.contadorMensagens));
+    contadorMensagem = Math.max(contadorMensagem, Number(dados.contadorMensagem));
   }
 }

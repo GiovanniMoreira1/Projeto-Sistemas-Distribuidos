@@ -1,12 +1,21 @@
+use std::collections::HashSet;
 use std::process;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use chat::agora_ms;
 use chat::proto::{Mensagem, Resposta, RespostaSub};
 use prost::Message as _;
 use rand::seq::SliceRandom;
+use rand::Rng;
+
+const MIN_CANAIS: usize = 5;
+const MIN_INSCRICOES: usize = 3;
+const MENSAGENS_POR_RODADA: u32 = 10;
+const INTERVALO: Duration = Duration::from_secs(1);
 
 fn enviar_requisicao(
     requester: &zmq::Socket,
@@ -32,15 +41,25 @@ fn enviar_requisicao(
     Ok(resposta)
 }
 
-fn inscrever_canal(canal: &str, subscriber: &zmq::Socket) -> zmq::Result<()> {
-    let topico = format!("{canal}|");
-    subscriber.set_subscribe(topico.as_bytes())?;
-    println!("cliente inscrito no {canal}");
-    Ok(())
-}
-
-fn receber_publicacoes(subscriber: zmq::Socket, contador: Arc<AtomicI32>) {
+fn receber_publicacoes(subscriber: zmq::Socket, inscricoes: Receiver<String>, contador: Arc<AtomicI32>) {
     loop {
+        // novas inscricoes pedidas pela thread principal (o socket so e usado nesta thread)
+        while let Ok(canal) = inscricoes.try_recv() {
+            let topico = format!("{canal}|");
+            if let Err(err) = subscriber.set_subscribe(topico.as_bytes()) {
+                eprintln!("Erro ao inscrever no {canal}: {err}");
+            }
+        }
+
+        match subscriber.poll(zmq::POLLIN, 200) {
+            Ok(0) => continue,
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!("Erro ao aguardar publicação: {err}");
+                break;
+            }
+        }
+
         match subscriber.recv_multipart(0) {
             Ok(frames) => {
                 if frames.len() < 2 {
@@ -96,32 +115,49 @@ fn main() -> zmq::Result<()> {
         reply = enviar_requisicao(&requester, &contador, "login", "", usuarios[indice_usuario])?;
     }
 
-    let mut canais_resp = enviar_requisicao(&requester, &contador, "listar", "", "")?;
-    if canais_resp.canais.len() < 5 {
-        println!(
-            "Erro: quantidade de canais insuficiente. É necessário ter pelo menos 5 canais cadastrados."
-        );
-        let novo_canal = format!("canal{}", canais_resp.canais.len() + 2);
-        enviar_requisicao(&requester, &contador, "cadastrar", "", &novo_canal)?;
-        canais_resp = enviar_requisicao(&requester, &contador, "listar", "", "")?;
-    }
+    let usuario = usuarios[indice_usuario];
+    println!("[{usuario}] {}", reply.resposta);
 
-    let canais = canais_resp.canais;
-    println!("Canais disponiveis: {}", canais.join(", "));
+    // o SUB fica numa thread propria; as inscricoes sao pedidas pela thread principal via canal
+    let (tx_inscricao, rx_inscricao) = mpsc::channel::<String>();
+    let contador_sub = Arc::clone(&contador);
+    thread::spawn(move || receber_publicacoes(subscriber, rx_inscricao, contador_sub));
 
     let mut rng = rand::thread_rng();
-    let escolhidos: Vec<&String> = canais.choose_multiple(&mut rng, 3.min(canais.len())).collect();
-    for canal in escolhidos {
-        inscrever_canal(canal, &subscriber)?;
-    }
+    let mut inscritos: HashSet<String> = HashSet::new();
 
-    let contador_sub = Arc::clone(&contador);
-    thread::spawn(move || receber_publicacoes(subscriber, contador_sub));
-
+    // comportamento padronizado dos bots (Parte 2)
     loop {
-        if let Some(aleatorio) = canais.choose(&mut rng) {
-            let msg = format!("Mensagem de teste para o canal {aleatorio}");
-            enviar_requisicao(&requester, &contador, "publicar", aleatorio, &msg)?;
+        let mut canais = enviar_requisicao(&requester, &contador, "listar", "", "")?.canais;
+
+        if canais.len() < MIN_CANAIS {
+            let novo = format!("canal{}", rng.gen_range(1000..10000));
+            let r = enviar_requisicao(&requester, &contador, "cadastrar", "", &novo)?;
+            println!("[{usuario}] criar {novo}: {} {}", r.status, r.resposta);
+            canais = enviar_requisicao(&requester, &contador, "listar", "", "")?.canais;
+        }
+
+        if inscritos.len() < MIN_INSCRICOES {
+            let disponiveis: Vec<&String> = canais.iter().filter(|c| !inscritos.contains(*c)).collect();
+            if let Some(escolhido) = disponiveis.choose(&mut rng) {
+                inscritos.insert((*escolhido).clone());
+                let _ = tx_inscricao.send((*escolhido).clone());
+                println!("[{usuario}] inscrito no {escolhido}");
+            }
+        }
+
+        let Some(canal) = canais.choose(&mut rng).cloned() else {
+            thread::sleep(INTERVALO);
+            continue;
+        };
+
+        for i in 1..=MENSAGENS_POR_RODADA {
+            let msg = format!("{usuario}: mensagem de teste para o canal {canal} ({i}/{MENSAGENS_POR_RODADA})");
+            let r = enviar_requisicao(&requester, &contador, "publicar", &canal, &msg)?;
+            if r.status != "200" {
+                println!("[{usuario}] erro ao publicar em {canal}: {} {}", r.status, r.resposta);
+            }
+            thread::sleep(INTERVALO);
         }
     }
 }
