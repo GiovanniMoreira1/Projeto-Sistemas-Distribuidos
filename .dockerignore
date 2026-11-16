@@ -1,0 +1,9 @@
+.git
+dados
+enunciado
+**/node_modules
+**/target
+**/bin
+**/obj
+**/.vs
+**/__pycache__

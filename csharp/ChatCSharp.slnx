@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="Broker/Broker.csproj" />
+  <Project Path="Cliente/Cliente.csproj" />
+  <Project Path="Proxy/Proxy.csproj" />
+  <Project Path="Referencia/Referencia.csproj" />
+  <Project Path="Servidor/Servidor.csproj" />
+</Solution>

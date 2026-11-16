@@ -1,0 +1,109 @@
+# Sistema completo: 1 broker, 1 proxy, 1 referencia (Python) e, para cada linguagem do grupo,
+# 2 servidores e 2 clientes. Todos falam o mesmo contrato (proto/client.proto).
+#
+# O nome do servico de cada servidor = NOME_SERVIDOR = endereco usado pelos outros servidores
+# (tcp://<nome>:5559) para eleicao, sincronizacao do relogio e transferencia de estado.
+# Cada servidor grava os seus dados em ./dados/<nome-do-servidor>/ (nada e compartilhado).
+
+x-python: &python
+  build: { context: ., dockerfile: python/Dockerfile }
+  image: sd-python
+x-javascript: &javascript
+  build: { context: ., dockerfile: javascript/Dockerfile }
+  image: sd-javascript
+x-rust: &rust
+  build: { context: ., dockerfile: rust/Dockerfile }
+  image: sd-rust
+x-csharp: &csharp
+  build: { context: ., dockerfile: csharp/Dockerfile }
+  image: sd-csharp
+x-java: &java
+  build: { context: ., dockerfile: java/Dockerfile }
+  image: sd-java
+
+x-servidor: &servidor
+  volumes:
+    - ./dados:/dados
+  depends_on: [broker, proxy, referencia]
+
+x-cliente: &cliente
+  deploy:
+    replicas: 2
+  depends_on: [broker, proxy]
+
+services:
+  # ------------------------------------------------------------- infraestrutura (Python)
+  broker:
+    <<: *python
+    command: python broker/main.py
+  proxy:
+    <<: *python
+    command: python proxy/main.py
+  referencia:
+    <<: *python
+    command: python referencia/main.py
+
+  # ------------------------------------------------------------- JavaScript
+  server-js-1:
+    <<: [*javascript, *servidor]
+    command: node servidor.js
+    environment: { NOME_SERVIDOR: server-js-1, DADOS_DIR: /dados }
+  server-js-2:
+    <<: [*javascript, *servidor]
+    command: node servidor.js
+    environment: { NOME_SERVIDOR: server-js-2, DADOS_DIR: /dados }
+  client-js:
+    <<: [*javascript, *cliente]
+    command: node client.js
+
+  # ------------------------------------------------------------- Python
+  server-python-1:
+    <<: [*python, *servidor]
+    command: python servidor/main.py
+    environment: { NOME_SERVIDOR: server-python-1, DADOS_DIR: /dados }
+  server-python-2:
+    <<: [*python, *servidor]
+    command: python servidor/main.py
+    environment: { NOME_SERVIDOR: server-python-2, DADOS_DIR: /dados }
+  client-python:
+    <<: [*python, *cliente]
+    command: python cliente/main.py
+
+  # ------------------------------------------------------------- Rust
+  server-rust-1:
+    <<: [*rust, *servidor]
+    command: servidor
+    environment: { NOME_SERVIDOR: server-rust-1, DADOS_DIR: /dados }
+  server-rust-2:
+    <<: [*rust, *servidor]
+    command: servidor
+    environment: { NOME_SERVIDOR: server-rust-2, DADOS_DIR: /dados }
+  client-rust:
+    <<: [*rust, *cliente]
+    command: client
+
+  # ------------------------------------------------------------- C#
+  server-csharp-1:
+    <<: [*csharp, *servidor]
+    command: dotnet servidor/Servidor.dll
+    environment: { NOME_SERVIDOR: server-csharp-1, DADOS_DIR: /dados }
+  server-csharp-2:
+    <<: [*csharp, *servidor]
+    command: dotnet servidor/Servidor.dll
+    environment: { NOME_SERVIDOR: server-csharp-2, DADOS_DIR: /dados }
+  client-csharp:
+    <<: [*csharp, *cliente]
+    command: dotnet cliente/Cliente.dll
+
+  # ------------------------------------------------------------- Java
+  server-java-1:
+    <<: [*java, *servidor]
+    command: sd.projeto.server.Server
+    environment: { NOME_SERVIDOR: server-java-1, DADOS_DIR: /dados }
+  server-java-2:
+    <<: [*java, *servidor]
+    command: sd.projeto.server.Server
+    environment: { NOME_SERVIDOR: server-java-2, DADOS_DIR: /dados }
+  client-java:
+    <<: [*java, *cliente]
+    command: sd.projeto.client.Client

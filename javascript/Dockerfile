@@ -1,3 +1,4 @@
+# contexto de build: raiz do repositorio (usa proto/client.proto compartilhado)
 FROM node:18-bullseye
 
 # Dependências de build para compilar o binding nativo do zeromq
@@ -7,11 +8,12 @@ RUN apt-get update && apt-get install -y \
     libzmq3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+WORKDIR /app/javascript
 
-COPY package*.json ./
+COPY javascript/package*.json ./
 RUN npm install
 
-COPY . .
+COPY proto/client.proto /app/proto/client.proto
+COPY javascript/ ./
 
 CMD ["node", "servidor.js"]
