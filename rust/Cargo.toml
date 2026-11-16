@@ -1,0 +1,15 @@
+[package]
+name = "chat"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+prost = "0.13"
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+# float_roundtrip: le os timestamps da transferencia de estado sem perder precisao (Parte 5)
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
+zmq = "0.10"
+
+[build-dependencies]
+prost-build = "0.13"

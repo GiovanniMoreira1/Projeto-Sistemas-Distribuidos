@@ -1,3 +1,0 @@
-pyzmq
-protobuf
-grpcio-tools

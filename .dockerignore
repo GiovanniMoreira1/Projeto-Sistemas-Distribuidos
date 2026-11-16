@@ -1,0 +1,9 @@
+.git
+dados
+enunciado
+**/node_modules
+**/target
+**/__pycache__
+csharp/**/bin
+csharp/**/obj
+csharp/.vs
