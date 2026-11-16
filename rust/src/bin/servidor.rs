@@ -1,16 +1,25 @@
 use std::collections::HashSet;
+use std::fmt::Display;
 use std::fs;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chat::agora_ms;
 use chat::proto::{Mensagem, Resposta, RespostaReferencia, RespostaSub};
 use prost::Message as _;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 const PORTA_SERVIDORES: u16 = 5559;
+const URL_REFERENCIA: &str = "tcp://referencia:5556";
+const HEARTBEAT_A_CADA: u64 = 10;
+const SINCRONIZAR_A_CADA: u64 = 15;
 const TEMPO_LIMITE_MS: i32 = 3000;
+const ESPERA_ANUNCIO: Duration = Duration::from_secs(10);
+const ESPERA_ASSINATURA: Duration = Duration::from_secs(1);
+const TOPICO_REPLICACAO: &str = "replicacao|";
 
 #[derive(Serialize, Deserialize)]
 struct UsuariosData {
@@ -38,7 +47,6 @@ struct PublicacaoRegistro {
     timestamp: f64,
 }
 
-/// Estado completo trocado na transferencia de estado entre servidores (Parte 5).
 #[derive(Serialize, Deserialize, Default)]
 struct EstadoServidor {
     #[serde(default)]
@@ -49,35 +57,57 @@ struct EstadoServidor {
     publicacoes: Vec<PublicacaoRegistro>,
 }
 
-/// Dados persistidos do servidor. Ficam num Mutex porque, a partir da Parte 5, tambem sao
-/// alterados pela thread de replicacao e lidos por quem pede a transferencia de estado.
+fn ler_json<T: for<'de> Deserialize<'de>>(caminho: &str, padrao: T) -> T {
+    match fs::read_to_string(caminho) {
+        Ok(conteudo) => serde_json::from_str(&conteudo).expect("falha ao ler json"),
+        Err(_) => padrao,
+    }
+}
+
+fn salvar_json<T: Serialize>(caminho: &str, dados: &T) {
+    let texto = serde_json::to_string(dados).expect("falha ao serializar json");
+    fs::write(caminho, texto).expect("falha ao gravar json");
+}
+
 struct Dados {
-    arquivos: Arquivos,
-    usuarios: UsuariosData,
+    caminho_canais: String,
+    caminho_logins: String,
+    caminho_publicacoes: String,
+    usuarios: Vec<String>,
     canais: CanaisData,
     logins: Vec<LoginRegistro>,
     publicacoes: Vec<PublicacaoRegistro>,
-    // chaves do que ja esta guardado: aplicar a mesma operacao duas vezes nao duplica o registro
     logins_vistos: HashSet<(String, u64)>,
     publicacoes_vistas: HashSet<(String, String, u64)>,
 }
 
 impl Dados {
-    fn carregar(arquivos: Arquivos) -> Dados {
+    fn carregar(diretorio: &Path) -> Dados {
+        let caminho = |nome: &str| diretorio.join(nome).to_string_lossy().into_owned();
         let usuarios: UsuariosData = ler_json("usuarios.json", UsuariosData { usuarios: Vec::new() });
-        let canais: CanaisData = ler_json(&arquivos.canais, CanaisData { canais: Vec::new() });
-        let logins: Vec<LoginRegistro> = ler_json(&arquivos.logins, Vec::new());
-        let publicacoes: Vec<PublicacaoRegistro> = ler_json(&arquivos.publicacoes, Vec::new());
+        let canais = ler_json(&caminho("canais.json"), CanaisData { canais: Vec::new() });
+        let logins: Vec<LoginRegistro> = ler_json(&caminho("login.json"), Vec::new());
+        let publicacoes: Vec<PublicacaoRegistro> = ler_json(&caminho("publicacoes.json"), Vec::new());
         let logins_vistos = logins.iter().map(|l| (l.usuario.clone(), l.timestamp.to_bits())).collect();
         let publicacoes_vistas = publicacoes
             .iter()
             .map(|p| (p.canal.clone(), p.conteudo.clone(), p.timestamp.to_bits()))
             .collect();
-        Dados { arquivos, usuarios, canais, logins, publicacoes, logins_vistos, publicacoes_vistas }
+        Dados {
+            caminho_canais: caminho("canais.json"),
+            caminho_logins: caminho("login.json"),
+            caminho_publicacoes: caminho("publicacoes.json"),
+            usuarios: usuarios.usuarios,
+            canais,
+            logins,
+            publicacoes,
+            logins_vistos,
+            publicacoes_vistas,
+        }
     }
 
     fn status_login(&self, usuario: &str) -> &'static str {
-        if self.usuarios.usuarios.iter().any(|u| u == usuario) { "200" } else { "404" }
+        if self.usuarios.iter().any(|u| u == usuario) { "200" } else { "404" }
     }
 
     fn registrar_login(&mut self, usuario: &str, timestamp: f64, status: &str) {
@@ -89,22 +119,20 @@ impl Dados {
             timestamp,
             status: status.to_string(),
         });
-        salvar_json(&self.arquivos.logins, &self.logins);
+        salvar_json(&self.caminho_logins, &self.logins);
     }
 
-    /// Devolve false se o canal ja existia.
     fn registrar_canal(&mut self, canal: &str) -> bool {
         if self.canais.canais.iter().any(|c| c == canal) {
             return false;
         }
         self.canais.canais.push(canal.to_string());
-        salvar_json(&self.arquivos.canais, &self.canais);
+        salvar_json(&self.caminho_canais, &self.canais);
         true
     }
 
     fn registrar_publicacao(&mut self, canal: &str, conteudo: &str, timestamp: f64) {
-        let chave = (canal.to_string(), conteudo.to_string(), timestamp.to_bits());
-        if !self.publicacoes_vistas.insert(chave) {
+        if !self.publicacoes_vistas.insert((canal.to_string(), conteudo.to_string(), timestamp.to_bits())) {
             return;
         }
         self.publicacoes.push(PublicacaoRegistro {
@@ -112,7 +140,7 @@ impl Dados {
             conteudo: conteudo.to_string(),
             timestamp,
         });
-        salvar_json(&self.arquivos.publicacoes, &self.publicacoes);
+        salvar_json(&self.caminho_publicacoes, &self.publicacoes);
     }
 
     fn exportar(&self) -> String {
@@ -124,7 +152,6 @@ impl Dados {
         serde_json::to_string(&estado).unwrap_or_default()
     }
 
-    /// Junta o estado recebido com o local (sem duplicar).
     fn importar(&mut self, texto: &str) -> Result<(), serde_json::Error> {
         let estado: EstadoServidor = serde_json::from_str(texto)?;
         for canal in &estado.canais {
@@ -140,868 +167,541 @@ impl Dados {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct MensagemRegistro {
-    usuario: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    acao: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    status: Option<String>,
-    conteudo: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    canal: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    timestamp: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    contador_mensagem: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    canais: Option<Vec<String>>,
-}
-
+#[derive(Default)]
 struct Estado {
-    nome_servidor: String,
-    rank_servidor: i32,
-    contador_mensagens: i32,
-    offset_relogio: f64,
-    servidor_eleito: String,
+    contador: i32,
+    offset_ms: f64,
+    rank: i32,
+    coordenador: String,
     em_eleicao: bool,
     anuncio_recebido: bool,
+    sincronizado: bool,
 }
 
-impl Estado {
-    fn timestamp_ajustado(&self) -> f64 {
-        agora_ms() + self.offset_relogio
+#[derive(Clone)]
+struct Servidor {
+    nome: String,
+    ctx: zmq::Context,
+    publicador: Arc<Mutex<zmq::Socket>>,
+    estado: Arc<Mutex<Estado>>,
+    dados: Arc<Mutex<Dados>>,
+}
+
+impl Servidor {
+    fn log(&self, texto: impl Display) {
+        println!("[{}] {texto}", self.nome);
     }
 
-    fn proximo_contador(&mut self) -> i32 {
-        self.contador_mensagens += 1;
-        self.contador_mensagens
+    fn agora(&self) -> f64 {
+        (agora_ms() + self.estado.lock().unwrap().offset_ms).floor()
     }
 
-    fn atualizar_contador(&mut self, recebido: i32) {
-        self.contador_mensagens = self.contador_mensagens.max(recebido);
+    fn proximo_contador(&self) -> i32 {
+        let mut st = self.estado.lock().unwrap();
+        st.contador += 1;
+        st.contador
     }
 
-    fn criar_resposta(&mut self, status: &str, resposta: &str, canais: Vec<String>) -> Resposta {
-        let contador = self.proximo_contador();
+    fn atualizar_contador(&self, recebido: i32) {
+        let mut st = self.estado.lock().unwrap();
+        st.contador = st.contador.max(recebido);
+    }
+
+    fn coordenador(&self) -> String {
+        self.estado.lock().unwrap().coordenador.clone()
+    }
+
+    fn criar_resposta(&self, status: &str, texto: &str, canais: Vec<String>) -> Resposta {
         Resposta {
             status: status.to_string(),
-            resposta: resposta.to_string(),
+            resposta: texto.to_string(),
             canais,
-            contador_mensagem: contador,
-            timestamp: self.timestamp_ajustado(),
+            contador_mensagem: self.proximo_contador(),
+            timestamp: self.agora(),
         }
     }
-}
 
-/// Le um json do disco; se o arquivo ainda nao existir (servidor novo), usa o valor padrao.
-fn ler_json<T: for<'de> Deserialize<'de>>(caminho: &str, padrao: T) -> T {
-    match fs::read_to_string(caminho) {
-        Ok(conteudo) => serde_json::from_str(&conteudo).expect("falha ao parsear json"),
-        Err(_) => padrao,
-    }
-}
-
-fn salvar_json<T: Serialize>(caminho: &str, dados: &T) {
-    let texto = serde_json::to_string(dados).expect("falha ao serializar json");
-    fs::write(caminho, texto).expect("falha ao salvar arquivo json");
-}
-
-/// Caminhos dos arquivos deste servidor: cada servidor tem o seu proprio diretorio
-/// (DADOS_DIR/NOME_SERVIDOR), nada e compartilhado entre servidores.
-struct Arquivos {
-    canais: String,
-    logins: String,
-    publicacoes: String,
-    mensagens: String,
-}
-
-impl Arquivos {
-    fn new(nome_servidor: &str) -> Arquivos {
-        let base = std::env::var("DADOS_DIR").unwrap_or_else(|_| "dados".to_string());
-        let dir = std::path::Path::new(&base).join(nome_servidor);
-        fs::create_dir_all(&dir).expect("falha ao criar diretorio de dados");
-        let caminho = |nome: &str| dir.join(nome).to_string_lossy().into_owned();
-        Arquivos {
-            canais: caminho("canais.json"),
-            logins: caminho("login.json"),
-            publicacoes: caminho("publicacoes.json"),
-            mensagens: caminho("mensagens.json"),
+    fn publicar_no_proxy(&self, topico: &str, corpo: Vec<u8>) {
+        let sock = self.publicador.lock().unwrap();
+        if let Err(erro) = sock.send_multipart([topico.as_bytes(), corpo.as_slice()], 0) {
+            self.log(format!("erro ao publicar em {topico}: {erro}"));
         }
     }
-}
 
-fn requisitar<R: prost::Message + Default>(
-    ctx: &zmq::Context,
-    url: &str,
-    payload: &Mensagem,
-) -> Option<R> {
-    let socket = ctx.socket(zmq::REQ).ok()?;
-    socket.set_sndtimeo(TEMPO_LIMITE_MS).ok()?;
-    socket.set_rcvtimeo(TEMPO_LIMITE_MS).ok()?;
-    socket.set_linger(0).ok()?;
-    socket.connect(url).ok()?;
-
-    socket.send(payload.encode_to_vec(), 0).ok()?;
-    let reply = socket.recv_bytes(0).ok()?;
-    R::decode(reply.as_slice()).ok()
-}
-
-fn consultar_rank(
-    referencia: &zmq::Socket,
-    estado: &Arc<Mutex<Estado>>,
-) -> Result<i32, String> {
-    let payload = {
-        let mut st = estado.lock().unwrap();
-        let contador = st.proximo_contador();
-        Mensagem {
-            timestamp: st.timestamp_ajustado(),
-            acao: "consultar_rank".to_string(),
+    fn requisitar(&self, url: &str, acao: &str) -> Option<Vec<u8>> {
+        let mensagem = Mensagem {
+            timestamp: self.agora(),
+            acao: acao.to_string(),
             canal: String::new(),
-            conteudo: st.nome_servidor.clone(),
-            contador_mensagem: contador,
-        }
-    };
-
-    referencia
-        .send(payload.encode_to_vec(), 0)
-        .map_err(|e| e.to_string())?;
-    let reply = referencia.recv_bytes(0).map_err(|e| e.to_string())?;
-    let objeto = RespostaReferencia::decode(reply.as_slice()).map_err(|e| e.to_string())?;
-
-    estado.lock().unwrap().atualizar_contador(objeto.contador_mensagem);
-
-    if objeto.status != "200" {
-        return Err(objeto.resposta);
-    }
-
-    Ok(objeto.rank)
-}
-
-fn listar_servidores(
-    ctx: &zmq::Context,
-    estado: &Arc<Mutex<Estado>>,
-) -> Vec<chat::proto::ServidorInfo> {
-    let payload = {
-        let mut st = estado.lock().unwrap();
-        let contador = st.proximo_contador();
-        Mensagem {
-            timestamp: st.timestamp_ajustado(),
-            acao: "listar_servidores".to_string(),
-            canal: String::new(),
-            conteudo: st.nome_servidor.clone(),
-            contador_mensagem: contador,
-        }
-    };
-
-    match requisitar::<RespostaReferencia>(ctx, "tcp://referencia:5556", &payload) {
-        Some(objeto) => {
-            estado.lock().unwrap().atualizar_contador(objeto.contador_mensagem);
-            if objeto.status == "200" {
-                objeto.servidores
-            } else {
-                Vec::new()
-            }
-        }
-        None => Vec::new(),
-    }
-}
-
-fn anunciar_coordenador(
-    pub_sock: &Arc<Mutex<zmq::Socket>>,
-    estado: &Arc<Mutex<Estado>>,
-) {
-    let payload_sub = {
-        let mut st = estado.lock().unwrap();
-        let contador = st.proximo_contador();
-        RespostaSub {
-            timestamp_envio: st.timestamp_ajustado(),
-            canal: "servers".to_string(),
-            conteudo: st.nome_servidor.clone(),
-            timestamp_recebimento: 0.0,
-            contador_mensagem: contador,
-        }
-    };
-
-    let sock = pub_sock.lock().unwrap();
-    if let Err(err) = sock.send_multipart([b"servers|".as_slice(), &payload_sub.encode_to_vec()], 0) {
-        eprintln!("Erro ao anunciar coordenador: {err}");
-    }
-}
-
-fn iniciar_eleicao(
-    ctx: zmq::Context,
-    pub_sock: Arc<Mutex<zmq::Socket>>,
-    estado: Arc<Mutex<Estado>>,
-) {
-    let (nome_servidor, rank_servidor) = {
-        let mut st = estado.lock().unwrap();
-        if st.em_eleicao {
-            return;
-        }
-        st.em_eleicao = true;
-        st.anuncio_recebido = false;
-        (st.nome_servidor.clone(), st.rank_servidor)
-    };
-
-    println!("Iniciando eleição...");
-
-    let servidores = listar_servidores(&ctx, &estado);
-    let maiores: Vec<_> = servidores
-        .into_iter()
-        .filter(|s| s.rank > rank_servidor && s.nome != nome_servidor)
-        .collect();
-
-    let mut algum_respondeu = false;
-    for alvo in maiores {
-        let payload = {
-            let mut st = estado.lock().unwrap();
-            let contador = st.proximo_contador();
-            Mensagem {
-                timestamp: st.timestamp_ajustado(),
-                acao: "eleicao".to_string(),
-                canal: String::new(),
-                conteudo: nome_servidor.clone(),
-                contador_mensagem: contador,
-            }
+            conteudo: self.nome.clone(),
+            contador_mensagem: self.proximo_contador(),
         };
+        let socket = self.ctx.socket(zmq::REQ).ok()?;
+        socket.set_sndtimeo(TEMPO_LIMITE_MS).ok()?;
+        socket.set_rcvtimeo(TEMPO_LIMITE_MS).ok()?;
+        socket.set_linger(0).ok()?;
+        socket.connect(url).ok()?;
+        socket.send(mensagem.encode_to_vec(), 0).ok()?;
+        socket.recv_bytes(0).ok()
+    }
 
-        let url = format!("tcp://{}:{PORTA_SERVIDORES}", alvo.nome);
-        if let Some(objeto) = requisitar::<Resposta>(&ctx, &url, &payload) {
-            estado.lock().unwrap().atualizar_contador(objeto.contador_mensagem);
-            if objeto.resposta == "OK" {
+    fn requisitar_servidor(&self, alvo: &str, acao: &str) -> Option<Resposta> {
+        let bytes = self.requisitar(&format!("tcp://{alvo}:{PORTA_SERVIDORES}"), acao)?;
+        let resposta = Resposta::decode(bytes.as_slice()).ok()?;
+        self.atualizar_contador(resposta.contador_mensagem);
+        Some(resposta)
+    }
+
+    fn requisitar_referencia(&self, acao: &str) -> Option<RespostaReferencia> {
+        let bytes = self.requisitar(URL_REFERENCIA, acao)?;
+        let resposta = RespostaReferencia::decode(bytes.as_slice()).ok()?;
+        self.atualizar_contador(resposta.contador_mensagem);
+        Some(resposta)
+    }
+
+    fn tentar_rank(&self) -> Option<i32> {
+        self.requisitar_referencia("consultar_rank")
+            .filter(|r| r.status == "200")
+            .map(|r| r.rank)
+    }
+
+    fn heartbeat(&self) {
+        match self.requisitar_referencia("heartbeat") {
+            None => self.log("heartbeat sem resposta da referência"),
+            Some(r) if r.status == "200" => self.log("heartbeat confirmado"),
+            Some(_) => {
+                if let Some(novo) = self.tentar_rank() {
+                    self.estado.lock().unwrap().rank = novo;
+                    self.log(format!("recadastrado na referência, rank {novo}"));
+                }
+            }
+        }
+    }
+
+    fn iniciar_eleicao(&self) {
+        {
+            let mut st = self.estado.lock().unwrap();
+            if st.em_eleicao {
+                return;
+            }
+            st.em_eleicao = true;
+            st.anuncio_recebido = false;
+        }
+        let servidor = self.clone();
+        thread::spawn(move || {
+            let refazer = servidor.executar_eleicao();
+            servidor.estado.lock().unwrap().em_eleicao = false;
+            if refazer {
+                servidor.iniciar_eleicao();
+            }
+        });
+    }
+
+    fn executar_eleicao(&self) -> bool {
+        self.log("iniciando eleição...");
+        let meu_rank = self.estado.lock().unwrap().rank;
+        let maiores: Vec<String> = self
+            .requisitar_referencia("listar_servidores")
+            .map(|r| r.servidores)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| s.rank > meu_rank && s.nome != self.nome)
+            .map(|s| s.nome)
+            .collect();
+
+        let mut algum_respondeu = false;
+        for alvo in &maiores {
+            if self.requisitar_servidor(alvo, "eleicao").is_some_and(|r| r.resposta == "OK") {
                 algum_respondeu = true;
             }
         }
+
+        if !algum_respondeu {
+            self.tornar_se_coordenador();
+            return false;
+        }
+
+        self.log("servidor de rank maior assumiu a eleição; aguardando anúncio...");
+        let inicio = Instant::now();
+        while inicio.elapsed() < ESPERA_ANUNCIO {
+            if self.estado.lock().unwrap().anuncio_recebido {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+        self.log("anúncio não chegou; refazendo eleição");
+        true
     }
 
-    if algum_respondeu {
-        println!("Servidor de rank maior assumiu a eleição. Aguardando anúncio...");
-        estado.lock().unwrap().em_eleicao = false;
-
-        let ctx_timer = ctx.clone();
-        let pub_timer = Arc::clone(&pub_sock);
-        let estado_timer = Arc::clone(&estado);
-        thread::spawn(move || {
-            thread::sleep(Duration::from_secs(10));
-            let precisa_reiniciar = !estado_timer.lock().unwrap().anuncio_recebido;
-            if precisa_reiniciar {
-                iniciar_eleicao(ctx_timer, pub_timer, estado_timer);
-            }
-        });
-    } else {
-        {
-            let mut st = estado.lock().unwrap();
-            st.servidor_eleito = nome_servidor.clone();
-            st.offset_relogio = 0.0;
+    fn tornar_se_coordenador(&self) {
+        let rank = {
+            let mut st = self.estado.lock().unwrap();
+            st.coordenador = self.nome.clone();
+            st.offset_ms = 0.0;
             st.anuncio_recebido = true;
-            st.em_eleicao = false;
-            println!("Servidor eleito como coordenador: {}", st.servidor_eleito);
-        }
-        anunciar_coordenador(&pub_sock, &estado);
-    }
-}
-
-fn ouvir_anuncios(sub: zmq::Socket, estado: Arc<Mutex<Estado>>) {
-    loop {
-        match sub.recv_multipart(0) {
-            Ok(frames) => {
-                if frames.len() < 2 {
-                    continue;
-                }
-                match RespostaSub::decode(frames[1].as_slice()) {
-                    Ok(objeto) => {
-                        let mut st = estado.lock().unwrap();
-                        st.atualizar_contador(objeto.contador_mensagem);
-                        st.servidor_eleito = objeto.conteudo;
-                        st.anuncio_recebido = true;
-                        println!("Novo coordenador anunciado: {}", st.servidor_eleito);
-                    }
-                    Err(err) => println!("Erro ao processar anúncio: {err}"),
-                }
-            }
-            Err(err) => {
-                println!("Erro ao ouvir anúncios: {err}");
-                break;
-            }
-        }
-    }
-}
-
-fn atender_servidores(
-    ctx: zmq::Context,
-    socket: zmq::Socket,
-    pub_sock: Arc<Mutex<zmq::Socket>>,
-    estado: Arc<Mutex<Estado>>,
-    dados: Arc<Mutex<Dados>>,
-) {
-    loop {
-        let request = match socket.recv_bytes(0) {
-            Ok(req) => req,
-            Err(err) => {
-                println!("Erro ao receber de servidor: {err}");
-                continue;
-            }
+            st.rank
         };
+        self.log(format!("eleito coordenador (rank {rank})"));
 
-        let payload = match Mensagem::decode(request.as_slice()) {
-            Ok(objeto) => {
-                // Parte 5: transferencia de estado (exportado antes de travar o Estado)
-                let estado_exportado = if objeto.acao == "obter_estado" {
-                    Some(dados.lock().unwrap().exportar())
-                } else {
-                    None
-                };
+        for _ in 0..2 {
+            let anuncio = RespostaSub {
+                timestamp_envio: self.agora(),
+                canal: "servers".to_string(),
+                conteudo: self.nome.clone(),
+                timestamp_recebimento: 0.0,
+                contador_mensagem: self.proximo_contador(),
+            };
+            self.publicar_no_proxy("servers|", anuncio.encode_to_vec());
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
 
-                let mut iniciar = false;
-                let resp = {
-                    let mut st = estado.lock().unwrap();
-                    st.atualizar_contador(objeto.contador_mensagem);
+    fn ouvir_anuncios(&self, sub: zmq::Socket) {
+        while let Ok(frames) = sub.recv_multipart(0) {
+            let Some(Ok(anuncio)) = frames.get(1).map(|f| RespostaSub::decode(f.as_slice())) else {
+                continue;
+            };
+            self.atualizar_contador(anuncio.contador_mensagem);
+            let mudou = {
+                let mut st = self.estado.lock().unwrap();
+                let mudou = st.coordenador != anuncio.conteudo;
+                st.coordenador = anuncio.conteudo.clone();
+                st.anuncio_recebido = true;
+                mudou
+            };
+            if mudou {
+                self.log(format!("novo coordenador anunciado: {}", anuncio.conteudo));
+            }
+        }
+    }
 
-                    match objeto.acao.as_str() {
+    fn atender_servidores(&self, socket: zmq::Socket) {
+        while let Ok(bytes) = socket.recv_bytes(0) {
+            let mut iniciar = false;
+            let resposta = match Mensagem::decode(bytes.as_slice()) {
+                Ok(pedido) => {
+                    self.atualizar_contador(pedido.contador_mensagem);
+                    match pedido.acao.as_str() {
+                        "obter_estado" if !self.estado.lock().unwrap().sincronizado => {
+                            self.criar_resposta("503", "Servidor ainda sincronizando", Vec::new())
+                        }
                         "obter_estado" => {
-                            println!("Estado enviado para {}", objeto.conteudo);
-                            st.criar_resposta("200", &estado_exportado.unwrap_or_default(), Vec::new())
+                            let estado = self.dados.lock().unwrap().exportar();
+                            self.log(format!("estado enviado para {}", pedido.conteudo));
+                            self.criar_resposta("200", &estado, Vec::new())
                         }
                         "eleicao" => {
                             iniciar = true;
-                            st.criar_resposta("200", "OK", Vec::new())
+                            self.criar_resposta("200", "OK", Vec::new())
                         }
-                        "sincronizar" => {
-                            if st.servidor_eleito == st.nome_servidor {
-                                st.criar_resposta("200", "Hora correta", Vec::new())
-                            } else {
-                                st.criar_resposta("400", "Não sou o coordenador!", Vec::new())
-                            }
+                        "sincronizar" if self.coordenador() == self.nome => {
+                            self.criar_resposta("200", "Hora correta", Vec::new())
                         }
-                        _ => st.criar_resposta("400", "Ação desconhecida!", Vec::new()),
+                        "sincronizar" => self.criar_resposta("400", "Não sou o coordenador!", Vec::new()),
+                        _ => self.criar_resposta("400", "Ação desconhecida!", Vec::new()),
                     }
-                };
-
-                let _ = socket.send(resp.encode_to_vec(), 0);
-
-                if iniciar {
-                    let ctx_c = ctx.clone();
-                    let pub_c = Arc::clone(&pub_sock);
-                    let st_c = Arc::clone(&estado);
-                    thread::spawn(move || iniciar_eleicao(ctx_c, pub_c, st_c));
                 }
+                Err(erro) => {
+                    self.log(format!("erro ao atender servidor: {erro}"));
+                    self.criar_resposta("500", "Erro interno no servidor!", Vec::new())
+                }
+            };
+            let _ = socket.send(resposta.encode_to_vec(), 0);
+            if iniciar {
+                self.iniciar_eleicao();
+            }
+        }
+    }
+
+    fn sincronizar_relogio(&self) {
+        let alvo = self.coordenador();
+        if alvo.is_empty() {
+            self.iniciar_eleicao();
+            return;
+        }
+        if alvo == self.nome {
+            self.log("sou o coordenador: relógio mantido");
+            return;
+        }
+
+        let t0 = agora_ms();
+        let resposta = self.requisitar_servidor(&alvo, "sincronizar");
+        let t1 = agora_ms();
+
+        match resposta {
+            Some(r) if r.status == "200" => {
+                let offset = r.timestamp + (t1 - t0) / 2.0 - t1;
+                self.estado.lock().unwrap().offset_ms = offset;
+                self.log(format!("relógio sincronizado com {alvo} (offset {offset:+.0} ms)"));
+            }
+            _ => {
+                self.log("coordenador indisponível; iniciando eleição");
+                self.iniciar_eleicao();
+            }
+        }
+    }
+
+    fn replicar(&self, acao: &str, canal: &str, conteudo: &str, timestamp: f64) {
+        let operacao = Mensagem {
+            timestamp,
+            acao: acao.to_string(),
+            canal: canal.to_string(),
+            conteudo: conteudo.to_string(),
+            contador_mensagem: self.proximo_contador(),
+        };
+        self.publicar_no_proxy(&format!("{TOPICO_REPLICACAO}{}", self.nome), operacao.encode_to_vec());
+    }
+
+    fn aplicar_operacao(&self, operacao: &Mensagem) {
+        let mut d = self.dados.lock().unwrap();
+        match operacao.acao.as_str() {
+            "login" => {
+                let status = d.status_login(&operacao.conteudo);
+                d.registrar_login(&operacao.conteudo, operacao.timestamp, status);
+            }
+            "cadastrar" => {
+                d.registrar_canal(&operacao.conteudo);
+            }
+            "publicar" => d.registrar_publicacao(&operacao.canal, &operacao.conteudo, operacao.timestamp),
+            _ => {}
+        }
+    }
+
+    fn ouvir_replicacao(&self, sub: zmq::Socket) {
+        let proprio = format!("{TOPICO_REPLICACAO}{}", self.nome);
+        while let Ok(frames) = sub.recv_multipart(0) {
+            if frames.len() < 2 {
                 continue;
             }
-            Err(err) => {
-                println!("Erro ao atender servidor: {err}");
-                estado
-                    .lock()
-                    .unwrap()
-                    .criar_resposta("500", "Erro interno no servidor!", Vec::new())
+            let topico = String::from_utf8_lossy(&frames[0]).into_owned();
+            if topico == proprio {
+                continue;
             }
-        };
-
-        let _ = socket.send(payload.encode_to_vec(), 0);
-    }
-}
-
-fn sincronizar_com_servidor_eleito(
-    ctx: &zmq::Context,
-    pub_sock: &Arc<Mutex<zmq::Socket>>,
-    estado: &Arc<Mutex<Estado>>,
-) {
-    let (servidor_eleito, nome_servidor, payload) = {
-        let mut st = estado.lock().unwrap();
-        if st.servidor_eleito.is_empty() {
-            drop(st);
-            let ctx_c = ctx.clone();
-            let pub_c = Arc::clone(pub_sock);
-            let st_c = Arc::clone(estado);
-            thread::spawn(move || iniciar_eleicao(ctx_c, pub_c, st_c));
-            return;
-        }
-        if st.servidor_eleito == st.nome_servidor {
-            println!("Este servidor é o coordenador. Relógio mantido.");
-            return;
-        }
-        let contador = st.proximo_contador();
-        let payload = Mensagem {
-            timestamp: st.timestamp_ajustado(),
-            acao: "sincronizar".to_string(),
-            canal: String::new(),
-            conteudo: st.nome_servidor.clone(),
-            contador_mensagem: contador,
-        };
-        (st.servidor_eleito.clone(), st.nome_servidor.clone(), payload)
-    };
-
-    let t0 = agora_ms();
-    let url = format!("tcp://{servidor_eleito}:{PORTA_SERVIDORES}");
-    let resposta = requisitar::<Resposta>(ctx, &url, &payload);
-    let t1 = agora_ms();
-
-    match resposta {
-        Some(objeto) if objeto.status == "200" => {
-            let mut st = estado.lock().unwrap();
-            st.atualizar_contador(objeto.contador_mensagem);
-            let hora_coordenador = objeto.timestamp + (t1 - t0) / 2.0;
-            st.offset_relogio = hora_coordenador - t1;
-            println!(
-                "Relógio sincronizado com {servidor_eleito} ({nome_servidor}): {}",
-                agora_ms() + st.offset_relogio
-            );
-        }
-        _ => {
-            println!("Coordenador indisponível. Iniciando eleição...");
-            let ctx_c = ctx.clone();
-            let pub_c = Arc::clone(pub_sock);
-            let st_c = Arc::clone(estado);
-            thread::spawn(move || iniciar_eleicao(ctx_c, pub_c, st_c));
+            match Mensagem::decode(frames[1].as_slice()) {
+                Ok(operacao) => {
+                    self.atualizar_contador(operacao.contador_mensagem);
+                    self.aplicar_operacao(&operacao);
+                    self.log(format!(
+                        "replicado de {}: {} {} {}",
+                        &topico[TOPICO_REPLICACAO.len()..],
+                        operacao.acao,
+                        operacao.canal,
+                        operacao.conteudo
+                    ));
+                }
+                Err(erro) => self.log(format!("erro ao ler replicação: {erro}")),
+            }
         }
     }
-}
 
-fn heartbeat(referencia: &zmq::Socket, estado: &Arc<Mutex<Estado>>) {
-    let payload = {
-        let mut st = estado.lock().unwrap();
-        let contador = st.proximo_contador();
-        Mensagem {
-            timestamp: st.timestamp_ajustado(),
-            acao: "heartbeat".to_string(),
-            canal: String::new(),
-            conteudo: st.nome_servidor.clone(),
-            contador_mensagem: contador,
+    fn obter_estado_inicial(&self) {
+        let atual = self.coordenador();
+        let mut candidatos = Vec::new();
+        if !atual.is_empty() && atual != self.nome {
+            candidatos.push(atual.clone());
         }
-    };
-
-    if let Err(err) = referencia.send(payload.encode_to_vec(), 0) {
-        println!("Erro ao enviar heartbeat: {err}");
-        return;
-    }
-
-    if let Ok(reply) = referencia.recv_bytes(0) {
-        if let Ok(objeto) = RespostaReferencia::decode(reply.as_slice()) {
-            estado.lock().unwrap().atualizar_contador(objeto.contador_mensagem);
-            if objeto.status == "200" {
-                println!("Heartbeat confirmado.");
-            } else {
-                // a referencia removeu este servidor (ficou muito tempo sem heartbeat): cadastra de novo
-                println!("Erro no heartbeat: {}", objeto.resposta);
-                if let Ok(rank) = consultar_rank(referencia, estado) {
-                    estado.lock().unwrap().rank_servidor = rank;
-                    println!("Recadastrado na referência, rank {rank}");
+        if let Some(lista) = self.requisitar_referencia("listar_servidores") {
+            for s in lista.servidores {
+                if s.nome != self.nome && s.nome != atual {
+                    candidatos.push(s.nome);
                 }
             }
         }
-    }
-}
 
-/// Publica uma vez no canal (topico "<canal>|"); o bot e quem manda 10 mensagens por rodada.
-fn publicar(
-    pub_sock: &Arc<Mutex<zmq::Socket>>,
-    estado: &Arc<Mutex<Estado>>,
-    dados: &Arc<Mutex<Dados>>,
-    req: &Mensagem,
-) -> zmq::Result<()> {
-    let payload_sub = {
-        let mut st = estado.lock().unwrap();
-        let contador = st.proximo_contador();
-        RespostaSub {
-            timestamp_envio: st.timestamp_ajustado(),
-            canal: req.canal.clone(),
-            conteudo: req.conteudo.clone(),
-            timestamp_recebimento: 0.0,
-            contador_mensagem: contador,
-        }
-    };
-
-    let topico = format!("{}|", req.canal);
-    pub_sock
-        .lock()
-        .unwrap()
-        .send_multipart([topico.as_bytes(), &payload_sub.encode_to_vec()], 0)?;
-
-    dados
-        .lock()
-        .unwrap()
-        .registrar_publicacao(&req.canal, &req.conteudo, req.timestamp);
-    replicar(pub_sock, estado, "publicar", &req.canal, &req.conteudo, req.timestamp);
-
-    println!("Mensagem publicada: {}", req.conteudo);
-    Ok(())
-}
-
-// ---------------------------------------------------------------- Parte 5: replicacao
-// Replicacao ativa: cada escrita aceita de um cliente (login, cadastrar, publicar) e aplicada
-// localmente e difundida no topico "replicacao|<servidor de origem>"; todos os servidores assinam
-// "replicacao|" e aplicam as escritas dos outros. Quem entra (ou volta) pede o estado completo a
-// outro servidor com "obter_estado".
-
-const TOPICO_REPLICACAO: &str = "replicacao|";
-
-fn replicar(
-    pub_sock: &Arc<Mutex<zmq::Socket>>,
-    estado: &Arc<Mutex<Estado>>,
-    acao: &str,
-    canal: &str,
-    conteudo: &str,
-    timestamp: f64,
-) {
-    let (topico, operacao) = {
-        let mut st = estado.lock().unwrap();
-        let contador = st.proximo_contador();
-        (
-            format!("{TOPICO_REPLICACAO}{}", st.nome_servidor),
-            Mensagem {
-                timestamp,
-                acao: acao.to_string(),
-                canal: canal.to_string(),
-                conteudo: conteudo.to_string(),
-                contador_mensagem: contador,
-            },
-        )
-    };
-
-    let sock = pub_sock.lock().unwrap();
-    if let Err(err) = sock.send_multipart([topico.as_bytes(), &operacao.encode_to_vec()], 0) {
-        println!("Erro ao replicar: {err}");
-    }
-}
-
-/// Aplica uma escrita feita por outro servidor (sem responder cliente nem republicar no canal).
-fn aplicar_operacao(dados: &Arc<Mutex<Dados>>, operacao: &Mensagem) {
-    let mut d = dados.lock().unwrap();
-    match operacao.acao.as_str() {
-        "login" => {
-            let status = d.status_login(&operacao.conteudo);
-            d.registrar_login(&operacao.conteudo, operacao.timestamp, status);
-        }
-        "cadastrar" => {
-            d.registrar_canal(&operacao.conteudo);
-        }
-        "publicar" => d.registrar_publicacao(&operacao.canal, &operacao.conteudo, operacao.timestamp),
-        _ => {}
-    }
-}
-
-fn ouvir_replicacao(sub: zmq::Socket, estado: Arc<Mutex<Estado>>, dados: Arc<Mutex<Dados>>) {
-    let proprio = format!("{TOPICO_REPLICACAO}{}", estado.lock().unwrap().nome_servidor);
-    loop {
-        let frames = match sub.recv_multipart(0) {
-            Ok(frames) if frames.len() >= 2 => frames,
-            Ok(_) => continue,
-            Err(err) => {
-                println!("Erro ao ouvir replicação: {err}");
-                break;
-            }
-        };
-        let topico = String::from_utf8_lossy(&frames[0]).into_owned();
-        if topico == proprio {
-            continue; // eco da propria escrita: ja foi aplicada
-        }
-        match Mensagem::decode(frames[1].as_slice()) {
-            Ok(operacao) => {
-                estado.lock().unwrap().atualizar_contador(operacao.contador_mensagem);
-                aplicar_operacao(&dados, &operacao);
-                println!(
-                    "Replicado de {}: {} {} {}",
-                    &topico[TOPICO_REPLICACAO.len()..],
-                    operacao.acao,
-                    operacao.canal,
-                    operacao.conteudo
-                );
-            }
-            Err(err) => println!("Erro ao decodificar replicação: {err}"),
-        }
-    }
-}
-
-/// Pede o estado ao coordenador (se for outro servidor) ou ao proximo servidor da lista.
-fn obter_estado_inicial(ctx: &zmq::Context, estado: &Arc<Mutex<Estado>>, dados: &Arc<Mutex<Dados>>) {
-    let (nome, atual) = {
-        let st = estado.lock().unwrap();
-        (st.nome_servidor.clone(), st.servidor_eleito.clone())
-    };
-
-    let mut candidatos = Vec::new();
-    if !atual.is_empty() && atual != nome {
-        candidatos.push(atual.clone());
-    }
-    for s in listar_servidores(ctx, estado) {
-        if s.nome != nome && s.nome != atual {
-            candidatos.push(s.nome);
-        }
-    }
-
-    for alvo in candidatos {
-        let payload = {
-            let mut st = estado.lock().unwrap();
-            let contador = st.proximo_contador();
-            Mensagem {
-                timestamp: st.timestamp_ajustado(),
-                acao: "obter_estado".to_string(),
-                canal: String::new(),
-                conteudo: nome.clone(),
-                contador_mensagem: contador,
-            }
-        };
-        let url = format!("tcp://{alvo}:{PORTA_SERVIDORES}");
-        if let Some(resposta) = requisitar::<Resposta>(ctx, &url, &payload) {
-            estado.lock().unwrap().atualizar_contador(resposta.contador_mensagem);
+        for alvo in candidatos {
+            let Some(resposta) = self.requisitar_servidor(&alvo, "obter_estado") else {
+                continue;
+            };
             if resposta.status != "200" {
                 continue;
             }
-            let mut d = dados.lock().unwrap();
+            let mut d = self.dados.lock().unwrap();
             match d.importar(&resposta.resposta) {
                 Ok(()) => {
-                    println!(
-                        "Estado recebido de {alvo}: {} canais, {} logins, {} publicacoes",
+                    let resumo = format!(
+                        "estado recebido de {alvo}: {} canais, {} logins, {} publicações",
                         d.canais.canais.len(),
                         d.logins.len(),
                         d.publicacoes.len()
                     );
+                    drop(d);
+                    self.log(resumo);
                     return;
                 }
-                Err(err) => println!("Estado inválido recebido de {alvo}: {err}"),
+                Err(erro) => self.log(format!("estado inválido recebido de {alvo}: {erro}")),
+            }
+        }
+        self.log("nenhum outro servidor respondeu: mantendo os dados locais");
+    }
+
+    fn tratar_login(&self, req: &Mensagem) -> Resposta {
+        let usuario = req.conteudo.trim();
+        let status = {
+            let mut d = self.dados.lock().unwrap();
+            let status = d.status_login(usuario);
+            d.registrar_login(usuario, req.timestamp, status);
+            status
+        };
+        self.replicar("login", "", usuario, req.timestamp);
+        if status == "200" {
+            self.criar_resposta("200", "Login realizado com sucesso!", Vec::new())
+        } else {
+            self.criar_resposta("404", "Nome de usuario incorreto!", Vec::new())
+        }
+    }
+
+    fn tratar_listar(&self) -> Resposta {
+        let lista = self.dados.lock().unwrap().canais.canais.clone();
+        self.criar_resposta("200", "Canais listados", lista)
+    }
+
+    fn tratar_cadastrar(&self, req: &Mensagem) -> Resposta {
+        let canal = req.conteudo.trim();
+        if canal.is_empty() || canal.len() > 50 || canal.contains('|') {
+            return self.criar_resposta("400", "Nome de canal invalido!", Vec::new());
+        }
+        if !self.dados.lock().unwrap().registrar_canal(canal) {
+            return self.criar_resposta("404", "Canal já existe!", Vec::new());
+        }
+        self.replicar("cadastrar", "", canal, req.timestamp);
+        self.criar_resposta("200", &format!("Canal {canal} cadastrado com sucesso!"), Vec::new())
+    }
+
+    fn tratar_publicar(&self, req: &Mensagem) -> Resposta {
+        let canal = req.canal.trim();
+        if canal.is_empty() || req.conteudo.is_empty() {
+            return self.criar_resposta("400", "Canal e mensagem sao obrigatorios!", Vec::new());
+        }
+
+        let publicacao = RespostaSub {
+            timestamp_envio: self.agora(),
+            canal: canal.to_string(),
+            conteudo: req.conteudo.clone(),
+            timestamp_recebimento: 0.0,
+            contador_mensagem: self.proximo_contador(),
+        };
+        self.publicar_no_proxy(&format!("{canal}|"), publicacao.encode_to_vec());
+
+        self.dados.lock().unwrap().registrar_publicacao(canal, &req.conteudo, req.timestamp);
+        self.replicar("publicar", canal, &req.conteudo, req.timestamp);
+        self.criar_resposta("200", &format!("Mensagem publicada no canal {canal} com sucesso!"), Vec::new())
+    }
+
+    fn atender_clientes(&self, socket: zmq::Socket, caminho_mensagens: &str) -> zmq::Result<()> {
+        let mut mensagens: Vec<serde_json::Value> = ler_json(caminho_mensagens, Vec::new());
+        let mut recebidas: u64 = 0;
+
+        loop {
+            let bytes = socket.recv_bytes(0)?;
+            let resposta = match Mensagem::decode(bytes.as_slice()) {
+                Ok(req) => {
+                    self.atualizar_contador(req.contador_mensagem);
+                    self.log(format!(
+                        "recebido: {} canal={} conteudo={} timestamp={} contador={}",
+                        req.acao, req.canal, req.conteudo, req.timestamp, req.contador_mensagem
+                    ));
+                    mensagens.push(json!({
+                        "usuario": "cliente",
+                        "acao": req.acao,
+                        "canal": req.canal,
+                        "conteudo": req.conteudo,
+                        "timestamp": req.timestamp,
+                        "contadorMensagem": req.contador_mensagem,
+                    }));
+                    match req.acao.as_str() {
+                        "login" => self.tratar_login(&req),
+                        "listar" => self.tratar_listar(),
+                        "cadastrar" => self.tratar_cadastrar(&req),
+                        "publicar" => self.tratar_publicar(&req),
+                        _ => self.criar_resposta("400", "Ação desconhecida!", Vec::new()),
+                    }
+                }
+                Err(erro) => {
+                    self.log(format!("erro ao processar mensagem: {erro}"));
+                    self.criar_resposta("500", "Erro interno no servidor!", Vec::new())
+                }
+            };
+
+            self.log(format!(
+                "enviado: {} {} timestamp={} contador={}",
+                resposta.status, resposta.resposta, resposta.timestamp, resposta.contador_mensagem
+            ));
+            socket.send(resposta.encode_to_vec(), 0)?;
+
+            mensagens.push(json!({
+                "usuario": "servidor",
+                "status": resposta.status,
+                "resposta": resposta.resposta,
+                "canais": resposta.canais,
+                "timestamp": resposta.timestamp,
+                "contadorMensagem": resposta.contador_mensagem,
+            }));
+            salvar_json(caminho_mensagens, &mensagens);
+
+            recebidas += 1;
+            if recebidas % HEARTBEAT_A_CADA == 0 {
+                self.heartbeat();
+            }
+            if recebidas % SINCRONIZAR_A_CADA == 0 {
+                self.sincronizar_relogio();
             }
         }
     }
-    println!("Nenhum outro servidor respondeu: mantendo os dados locais");
 }
 
 fn main() -> zmq::Result<()> {
-    // Nome do servidor = nome do servico no docker-compose: os outros servidores usam esse
-    // nome como endereco (tcp://<nome>:5559) para pedir eleicao e sincronizacao.
-    let nome_servidor =
-        std::env::var("NOME_SERVIDOR").unwrap_or_else(|_| "servidorRust".to_string());
-    let arquivos = Arquivos::new(&nome_servidor);
-    let caminho_mensagens = arquivos.mensagens.clone();
-    let mut mensagens: Vec<MensagemRegistro> = ler_json(&caminho_mensagens, Vec::new());
-    let dados = Arc::new(Mutex::new(Dados::carregar(arquivos)));
+    let nome = std::env::var("NOME_SERVIDOR").unwrap_or_else(|_| "servidorRust".to_string());
+    let base = std::env::var("DADOS_DIR").unwrap_or_else(|_| "dados".to_string());
+    let diretorio = Path::new(&base).join(&nome);
+    fs::create_dir_all(&diretorio).expect("falha ao criar diretorio de dados");
+    let caminho_mensagens = diretorio.join("mensagens.json").to_string_lossy().into_owned();
 
     let ctx = zmq::Context::new();
-    let responder = ctx.socket(zmq::REP)?;
-    let resposta_servidores = ctx.socket(zmq::REP)?;
-    let pub_sock = Arc::new(Mutex::new(ctx.socket(zmq::PUB)?));
-    let sub = ctx.socket(zmq::SUB)?;
-    let sub_replicacao = ctx.socket(zmq::SUB)?;
-    let referencia = ctx.socket(zmq::REQ)?;
+    let publicador = ctx.socket(zmq::PUB)?;
+    publicador.connect("tcp://proxy:5557")?;
 
-    pub_sock.lock().unwrap().connect("tcp://proxy:5557")?;
-    sub.connect("tcp://proxy:5558")?;
-    sub.set_subscribe(b"servers")?;
-    // Parte 5: assina a replicacao antes de pedir o estado, para nao perder escritas no meio
+    let servidor = Servidor {
+        nome,
+        ctx: ctx.clone(),
+        publicador: Arc::new(Mutex::new(publicador)),
+        estado: Arc::new(Mutex::new(Estado::default())),
+        dados: Arc::new(Mutex::new(Dados::carregar(&diretorio))),
+    };
+    servidor.log(format!("dados em {}", diretorio.display()));
+
+    let sub_anuncios = ctx.socket(zmq::SUB)?;
+    sub_anuncios.connect("tcp://proxy:5558")?;
+    sub_anuncios.set_subscribe(b"servers|")?;
+    let s = servidor.clone();
+    thread::spawn(move || s.ouvir_anuncios(sub_anuncios));
+
+    let sub_replicacao = ctx.socket(zmq::SUB)?;
     sub_replicacao.connect("tcp://proxy:5558")?;
     sub_replicacao.set_subscribe(TOPICO_REPLICACAO.as_bytes())?;
-    responder.connect("tcp://broker:5560")?;
-    resposta_servidores.bind(&format!("tcp://*:{PORTA_SERVIDORES}"))?;
-    referencia.connect("tcp://referencia:5556")?;
+    let s = servidor.clone();
+    thread::spawn(move || s.ouvir_replicacao(sub_replicacao));
 
-    println!("Servidor conectado ao broker...");
-    println!("Servidor conectado ao proxy...");
-    println!("Servidor conectado à referência...");
+    let socket_servidores = ctx.socket(zmq::REP)?;
+    socket_servidores.bind(&format!("tcp://*:{PORTA_SERVIDORES}"))?;
+    let s = servidor.clone();
+    thread::spawn(move || s.atender_servidores(socket_servidores));
 
-    let estado = Arc::new(Mutex::new(Estado {
-        nome_servidor,
-        rank_servidor: 0,
-        contador_mensagens: 0,
-        offset_relogio: 0.0,
-        servidor_eleito: String::new(),
-        em_eleicao: false,
-        anuncio_recebido: false,
-    }));
-
-    let rank = consultar_rank(&referencia, &estado).expect("falha ao consultar rank");
-    estado.lock().unwrap().rank_servidor = rank;
-    println!("Rank do servidor: {rank}");
-
-    let estado_sub = Arc::clone(&estado);
-    thread::spawn(move || ouvir_anuncios(sub, estado_sub));
-
-    let estado_rep = Arc::clone(&estado);
-    let dados_rep = Arc::clone(&dados);
-    thread::spawn(move || ouvir_replicacao(sub_replicacao, estado_rep, dados_rep));
-
-    let ctx_srv = ctx.clone();
-    let pub_srv = Arc::clone(&pub_sock);
-    let estado_srv = Arc::clone(&estado);
-    let dados_srv = Arc::clone(&dados);
-    thread::spawn(move || {
-        atender_servidores(ctx_srv, resposta_servidores, pub_srv, estado_srv, dados_srv)
-    });
-
-    obter_estado_inicial(&ctx, &estado, &dados);
-
-    let ctx_el = ctx.clone();
-    let pub_el = Arc::clone(&pub_sock);
-    let estado_el = Arc::clone(&estado);
-    thread::spawn(move || iniciar_eleicao(ctx_el, pub_el, estado_el));
-
-    let mut mensagens_recebidas: u64 = 0;
-
-    loop {
-        let request = responder.recv_bytes(0)?;
-        let req = match Mensagem::decode(request.as_slice()) {
-            Ok(m) => m,
-            Err(err) => {
-                println!("Erro ao processar mensagem: {err}");
-                let payload = estado.lock().unwrap().criar_resposta(
-                    "500",
-                    "Erro interno no servidor!",
-                    Vec::new(),
-                );
-                responder.send(payload.encode_to_vec(), 0)?;
-                continue;
-            }
-        };
-
-        estado.lock().unwrap().atualizar_contador(req.contador_mensagem);
-        mensagens_recebidas += 1;
-
-        if mensagens_recebidas % 10 == 0 {
-            heartbeat(&referencia, &estado);
+    let rank = loop {
+        if let Some(rank) = servidor.tentar_rank() {
+            break rank;
         }
+        servidor.log("aguardando o serviço de referência...");
+        thread::sleep(Duration::from_secs(1));
+    };
+    servidor.estado.lock().unwrap().rank = rank;
+    servidor.log(format!("rank {rank}"));
 
-        if mensagens_recebidas % 15 == 0 {
-            sincronizar_com_servidor_eleito(&ctx, &pub_sock, &estado);
-        }
+    thread::sleep(ESPERA_ASSINATURA);
+    servidor.obter_estado_inicial();
+    servidor.estado.lock().unwrap().sincronizado = true;
+    servidor.iniciar_eleicao();
 
-        mensagens.push(MensagemRegistro {
-            usuario: "cliente".to_string(),
-            acao: Some(req.acao.clone()),
-            status: None,
-            conteudo: req.conteudo.clone(),
-            canal: Some(req.canal.clone()),
-            timestamp: Some(req.timestamp),
-            contador_mensagem: Some(req.contador_mensagem),
-            canais: None,
-        });
-        salvar_json(&caminho_mensagens, &mensagens);
-
-        match req.acao.as_str() {
-            "login" => {
-                let status = {
-                    let mut d = dados.lock().unwrap();
-                    let status = d.status_login(&req.conteudo);
-                    d.registrar_login(&req.conteudo, req.timestamp, status);
-                    status
-                };
-                let texto = if status == "200" {
-                    "Login realizado com sucesso!"
-                } else {
-                    "Nome de usuario incorreto!"
-                };
-                replicar(&pub_sock, &estado, "login", "", &req.conteudo, req.timestamp);
-
-                let payload = estado
-                    .lock()
-                    .unwrap()
-                    .criar_resposta(status, texto, Vec::new());
-                responder.send(payload.encode_to_vec(), 0)?;
-
-                mensagens.push(MensagemRegistro {
-                    usuario: "servidor".to_string(),
-                    acao: None,
-                    status: Some(status.to_string()),
-                    conteudo: texto.to_string(),
-                    canal: None,
-                    timestamp: None,
-                    contador_mensagem: None,
-                    canais: None,
-                });
-                salvar_json(&caminho_mensagens, &mensagens);
-            }
-            "listar" => {
-                let lista = dados.lock().unwrap().canais.canais.clone();
-                let payload = estado.lock().unwrap().criar_resposta(
-                    "200",
-                    "Canais listados",
-                    lista.clone(),
-                );
-                responder.send(payload.encode_to_vec(), 0)?;
-
-                mensagens.push(MensagemRegistro {
-                    usuario: "servidor".to_string(),
-                    acao: None,
-                    status: Some("200".to_string()),
-                    conteudo: "Canais listados".to_string(),
-                    canal: None,
-                    timestamp: None,
-                    contador_mensagem: None,
-                    canais: Some(lista),
-                });
-                salvar_json(&caminho_mensagens, &mensagens);
-            }
-            "cadastrar" => {
-                let criado = dados.lock().unwrap().registrar_canal(&req.conteudo);
-                let (status, texto) = if criado {
-                    replicar(&pub_sock, &estado, "cadastrar", "", &req.conteudo, req.timestamp);
-                    (
-                        "200",
-                        format!("Canal {} cadastrado com sucesso!", req.conteudo),
-                    )
-                } else {
-                    ("404", "Canal já existe!".to_string())
-                };
-
-                let payload = estado
-                    .lock()
-                    .unwrap()
-                    .criar_resposta(status, &texto, Vec::new());
-                responder.send(payload.encode_to_vec(), 0)?;
-
-                mensagens.push(MensagemRegistro {
-                    usuario: "servidor".to_string(),
-                    acao: None,
-                    status: Some(status.to_string()),
-                    conteudo: texto,
-                    canal: None,
-                    timestamp: None,
-                    contador_mensagem: None,
-                    canais: None,
-                });
-                salvar_json(&caminho_mensagens, &mensagens);
-            }
-            "publicar" => {
-                let (status, texto) = match publicar(
-                    &pub_sock,
-                    &estado,
-                    &dados,
-                    &req,
-                ) {
-                    Ok(()) => (
-                        "200",
-                        format!("Mensagem publicada no canal {} com sucesso!", req.canal),
-                    ),
-                    Err(err) => {
-                        println!("Erro ao publicar: {err}");
-                        ("500", "Erro ao publicar mensagem!".to_string())
-                    }
-                };
-
-                let payload = estado
-                    .lock()
-                    .unwrap()
-                    .criar_resposta(status, &texto, Vec::new());
-                responder.send(payload.encode_to_vec(), 0)?;
-
-                mensagens.push(MensagemRegistro {
-                    usuario: "servidor".to_string(),
-                    acao: None,
-                    status: Some(status.to_string()),
-                    conteudo: texto,
-                    canal: None,
-                    timestamp: None,
-                    contador_mensagem: None,
-                    canais: None,
-                });
-                salvar_json(&caminho_mensagens, &mensagens);
-            }
-            _ => {
-                let payload = estado.lock().unwrap().criar_resposta(
-                    "400",
-                    "Ação desconhecida!",
-                    Vec::new(),
-                );
-                responder.send(payload.encode_to_vec(), 0)?;
-            }
-        }
-    }
+    let socket_clientes = ctx.socket(zmq::REP)?;
+    socket_clientes.connect("tcp://broker:5560")?;
+    servidor.atender_clientes(socket_clientes, &caminho_mensagens)
 }

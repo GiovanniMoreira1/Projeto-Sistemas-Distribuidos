@@ -27,13 +27,11 @@
       <artifactId>junit-jupiter-api</artifactId>
       <scope>test</scope>
     </dependency>
-    <!-- Optionally: parameterized tests support -->
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter-params</artifactId>
       <scope>test</scope>
     </dependency>
-    <!-- Source: https://mvnrepository.com/artifact/org.zeromq/jeromq -->
     <dependency>
       <groupId>org.zeromq</groupId>
       <artifactId>jeromq</artifactId>
@@ -45,7 +43,6 @@
       <artifactId>protobuf-java</artifactId>
       <version>4.36.1</version>
     </dependency>
-    <!-- leitura do usuarios.json e transferencia de estado entre servidores (Parte 5) -->
     <dependency>
       <groupId>com.google.code.gson</groupId>
       <artifactId>gson</artifactId>

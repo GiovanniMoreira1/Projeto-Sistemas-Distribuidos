@@ -15,7 +15,6 @@ var contadorMensagem = 0;
 const inscritos = new Set();
 
 async function run() {
-  // o primeiro nome nao existe de proposito, para exercitar a repeticao do login
   var usuarios = ["usuario1", "usuario2", "usuario3", "teste", "teste2", "teste3", "teste4", "teste5"];
   const root = await protobuf.load(ARQUIVO_PROTO);
 
@@ -54,7 +53,6 @@ async function run() {
 
   receberPublicacoes(subscriber, RespostaSub).catch(console.error);
 
-  // comportamento padronizado dos bots (Parte 2)
   while (true) {
     var canais = (await listarCanais(requester, Mensagem, Resposta)).canais;
 
@@ -178,7 +176,6 @@ function inscreverCanal(canal, subscriber, usuario) {
   inscritos.add(canal);
   console.log(`[${usuario}] inscrito no ${canal}`);
 }
-
 
 async function receberPublicacoes(subscriber, RespostaSub) {
   for await (const [topic, msg] of subscriber) {

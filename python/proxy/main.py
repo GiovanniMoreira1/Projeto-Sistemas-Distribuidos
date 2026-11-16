@@ -2,7 +2,6 @@ import zmq
 
 contexto = zmq.Context()
 
-# servidores publicam no XSUB (5557) e clientes assinam no XPUB (5558).
 xsub = contexto.socket(zmq.XSUB)
 xpub = contexto.socket(zmq.XPUB)
 

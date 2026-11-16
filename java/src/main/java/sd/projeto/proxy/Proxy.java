@@ -7,7 +7,6 @@ import org.zeromq.ZContext;
 public class Proxy {
     public static void main(String[] args) {
         try (ZContext context = new ZContext()) {
-
             ZMQ.Socket frontend = context.createSocket(SocketType.XSUB);
             frontend.bind("tcp://*:5557");
 

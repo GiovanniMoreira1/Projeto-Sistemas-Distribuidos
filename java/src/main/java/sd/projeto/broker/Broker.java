@@ -7,7 +7,6 @@ import org.zeromq.ZContext;
 public class Broker {
     public static void main(String[] args) {
         try (ZContext context = new ZContext()) {
-
             ZMQ.Socket frontend = context.createSocket(SocketType.ROUTER);
             frontend.bind("tcp://*:5559");
 

@@ -1,149 +1,234 @@
-# Sistema distribuído de troca de mensagens (Partes 1 a 5)
+# Projeto de Sistemas Distribuídos: troca de mensagens em canais
 
-Projeto de Sistemas Distribuídos: uma versão simples de um BBS/IRC em que bots (clientes) fazem login,
-criam canais e publicam mensagens, e servidores atendem esses bots, sincronizam relógios, elegem um
-coordenador e replicam os dados entre si. Tudo roda em containers e conversa por ZeroMQ.
+Versão simplificada de um BBS/IRC feita para a disciplina de Sistemas Distribuídos. Bots fazem login,
+criam canais e publicam mensagens; os servidores atendem os bots, sincronizam os relógios, elegem um
+coordenador e replicam os dados entre si. Toda a comunicação é feita com ZeroMQ e tudo roda em containers.
 
-O grupo implementou **cliente e servidor em 5 linguagens**, e todos funcionam juntos ao mesmo tempo:
-qualquer cliente pode ser atendido por qualquer servidor, e os servidores de linguagens diferentes
-participam da mesma eleição e da mesma replicação.
+Cada integrante do grupo implementou cliente e servidor em uma linguagem diferente:
 
 | Linguagem | Pasta | Cliente | Servidor |
 |---|---|---|---|
-| JavaScript (Node.js) | `javascript/` | `client.js` | `servidor.js` |
-| Python | `python/` | `cliente/main.py` | `servidor/main.py` |
+| JavaScript (Node 18) | `javascript/` | `client.js` | `servidor.js` |
+| Python 3.13 | `python/` | `cliente/main.py` | `servidor/main.py` |
 | Rust | `rust/` | `src/bin/client.rs` | `src/bin/servidor.rs` |
-| C# (.NET) | `csharp/` | `Cliente/Program.cs` | `Servidor/Program.cs` |
-| Java | `java/` | `sd/projeto/client/Client.java` | `sd/projeto/server/Server.java` |
+| C# (.NET 10) | `csharp/` | `Cliente/Program.cs` | `Servidor/Program.cs` |
+| Java 21 | `java/` | `sd/projeto/client/Client.java` | `sd/projeto/server/Server.java` |
 
-Broker, proxy e serviço de referência usados no `docker-compose.yml` são os da implementação em
-Python (`python/broker`, `python/proxy`, `python/referencia`). As outras linguagens também têm as suas
-versões desses processos nas próprias pastas, mas só uma instância de cada sobe no sistema.
+Todos rodam ao mesmo tempo e conversam entre si: um bot Java pode ser atendido por um servidor Rust, a
+publicação chega a um bot Python, e a eleição envolve servidores das cinco linguagens.
 
-## Como executar
+## Como rodar
 
 ```
 docker compose up --build
 ```
 
-Sobe 1 broker, 1 proxy, 1 referência e, para cada linguagem, 2 servidores e 2 clientes
-(10 servidores e 10 clientes no total). Os dados de cada servidor ficam em
-`./dados/<nome-do-servidor>/`. Para começar do zero, apague a pasta `dados/`.
+O compose sobe 1 broker, 1 proxy, 1 serviço de referência e, para cada linguagem, 2 servidores e 2 bots.
+Os bots funcionam sozinhos, sem interação.
 
-## Contrato comum
-
-O que une as 5 implementações é o contrato de comunicação, igual em todas:
-
-- **Serialização:** Protocol Buffers em binário, a partir de um único arquivo, `proto/client.proto`.
-  Cada linguagem gera o seu código a partir dele durante o build.
-- **Mensagens:** `Mensagem` (requisição), `Resposta` (resposta de servidor), `RespostaSub`
-  (publicação e anúncio de coordenador) e `RespostaReferencia` (resposta da referência).
-  Todas carregam o `timestamp` do envio (ms) e o `contadorMensagem` (relógio lógico).
-- **Portas e padrões:**
+Os dados de cada servidor ficam em `dados/<nome-do-servidor>/`. Para começar do zero:
 
 ```
-Req-Rep:           cliente (REQ) -> broker (ROUTER :5559 / DEALER :5560) -> servidor (REP)
-Pub-Sub:           servidor (PUB) -> proxy (XSUB :5557 / XPUB :5558) -> cliente/servidor (SUB)
-Referência:        servidor (REQ) -> referência (REP :5556)
-Servidor-servidor: servidor (REQ) -> outro servidor (REP :5559)
+docker compose down
+rm -rf dados
 ```
 
-- **Ações:**
-  - clientes: `login`, `listar`, `cadastrar`, `publicar`
-  - servidor → referência: `consultar_rank`, `listar_servidores`, `heartbeat`
-  - servidor → servidor: `eleicao`, `sincronizar`, `obter_estado`
-- **Status:** `login` 200/404, `listar` 200, `cadastrar` 200/404 (já existe)/400 (nome inválido),
-  `publicar` 200/400.
-- **Tópicos:** `"<canal>|"` para as publicações dos bots (o `|` evita que `canal1` também receba
-  `canal10`), `servers|` para o anúncio do coordenador e `replicacao|<servidor>` para a replicação.
-- **Nome do servidor:** é o nome do serviço no compose (variável `NOME_SERVIDOR`) e também o endereço
-  usado pelos outros servidores (`tcp://<nome>:5559`). Por isso precisa ser único.
+Broker, proxy e referência usados no compose são os da pasta `python/`. As outras linguagens também têm
+a sua versão desses processos (por exemplo `javascript/broker.js` e `csharp/Referencia/`), que podem ser
+usadas no lugar, mas no compose sobe só uma instância de cada.
 
-## Partes 1 a 4 (resumo)
+## Arquitetura
 
-- **Parte 1:** login (sem senha, repetido em caso de erro), criação e listagem de canais via Req-Rep
-  pelo broker. Cada servidor persiste os seus dados no próprio diretório.
-- **Parte 2:** publicação em canais via Pub-Sub pelo proxy. O bot segue o comportamento padronizado:
-  cria um canal se houver menos de 5, inscreve-se em mais um se tiver menos de 3 inscrições e, em
-  loop, escolhe um canal e envia 10 mensagens com 1 s de intervalo.
-- **Parte 3:** relógio lógico em todas as mensagens (incrementa antes de enviar e assume o máximo ao
-  receber). O serviço de referência dá o rank, guarda a lista de servidores e remove quem fica 30 s
-  sem heartbeat (enviado a cada 10 mensagens de clientes).
-- **Parte 4:** eleição pelo algoritmo do valentão (bully): vence o maior rank, que se anuncia no
-  tópico `servers`. A cada 15 mensagens de clientes cada servidor pede a hora ao coordenador e corrige
-  o seu relógio físico (somando metade do tempo de ida e volta). Se o coordenador não responde em 3 s,
-  começa uma nova eleição.
+```
+bots (REQ) ──> broker ROUTER :5559 / DEALER :5560 ──> servidores (REP)
+servidores (PUB) ──> proxy XSUB :5557 / XPUB :5558 ──> bots e servidores (SUB)
+servidores (REQ) ──> referência (REP :5556)
+servidor (REQ) ──> outro servidor (REP :5559)
+```
+
+- **Broker:** distribui os pedidos dos bots entre os servidores (round-robin). Por isso dá para adicionar ou
+  remover servidores sem parar o sistema.
+- **Proxy:** repassa as publicações. Os bots assinam os canais por ele, e os servidores também o usam para
+  avisar quem é o coordenador e para replicar dados.
+- **Referência:** dá o rank de cada servidor, guarda a lista de servidores ativos e tira da lista quem fica
+  30 s sem mandar heartbeat.
+- **Servidor ↔ servidor:** usado para eleição, sincronização do relógio e transferência de estado.
+
+O nome de cada servidor é o nome do serviço no compose (variável `NOME_SERVIDOR`, por exemplo
+`server-rust-1`). Os outros servidores usam esse nome como endereço (`tcp://server-rust-1:5559`), então ele
+precisa ser único.
+
+## Mensagens
+
+As cinco linguagens geram o código a partir do mesmo arquivo, `proto/client.proto`. A serialização é
+Protocol Buffers em binário: o enunciado não permite JSON nem texto puro, e com um `.proto` só ninguém
+precisa reimplementar o formato à mão.
+
+| Mensagem | Uso |
+|---|---|
+| `Mensagem` | todo pedido: bot → servidor, servidor → referência, servidor → servidor e operações replicadas |
+| `Resposta` | resposta de um servidor |
+| `RespostaSub` | publicação num canal e anúncio de coordenador |
+| `RespostaReferencia` | resposta da referência (rank e lista de servidores) |
+
+Toda mensagem leva `timestamp` (ms) e `contadorMensagem` (relógio lógico).
+
+Ações e respostas:
+
+| Ação | Quem envia | Status |
+|---|---|---|
+| `login` | bot | 200 ok, 404 usuário não existe |
+| `listar` | bot | 200, lista em `canais` |
+| `cadastrar` | bot | 200 ok, 404 canal já existe, 400 nome inválido |
+| `publicar` | bot | 200 ok, 400 canal ou texto vazio |
+| `consultar_rank`, `listar_servidores`, `heartbeat` | servidor → referência | 200, 404 servidor não cadastrado |
+| `eleicao`, `sincronizar`, `obter_estado` | servidor → servidor | 200, 400 não sou o coordenador, 503 ainda sincronizando |
+
+Tópicos do Pub/Sub:
+
+- `<canal>|`: publicações dos bots. O `|` no fim evita que quem assina `canal1` receba também `canal10`,
+  já que o filtro do ZeroMQ é por prefixo.
+- `servers|`: anúncio do coordenador eleito.
+- `replicacao|<servidor>`: escritas replicadas (Parte 5).
+
+Não há senha. O login só aceita os usuários de `usuarios.json` (`teste`, `teste2` ... `teste10`). Cada bot
+tenta primeiro um nome que não existe, para mostrar a repetição do login em caso de erro.
+
+## O bot
+
+Todos os bots seguem o comportamento definido na Parte 2:
+
+1. faz login, repetindo com outro nome se der erro;
+2. se existirem menos de 5 canais, cria um;
+3. se estiver inscrito em menos de 3 canais, se inscreve em mais um;
+4. escolhe um canal e manda 10 mensagens, uma por segundo, e volta para o passo 2.
+
+Enquanto espera entre as mensagens, o bot mostra tudo o que chega nos canais assinados: canal, mensagem,
+horário de envio, horário de recebimento e relógio lógico.
+
+## Persistência
+
+Cada servidor grava só no seu diretório; nenhum arquivo é compartilhado. O formato varia por linguagem,
+mas todos guardam as mesmas informações:
+
+| Linguagem | Arquivos |
+|---|---|
+| JavaScript, Rust | `canais.json`, `login.json`, `publicacoes.json`, `mensagens.json` |
+| Python, C# | `canais.json`, `login.json`, `publicacoes.jsonl`, `mensagens.jsonl` |
+| Java | `canais.txt`, `login.txt`, `publicacoes.txt`, `mensagens.txt` (CSV simples) |
+
+- `login`: usuário, timestamp e status de cada tentativa de login, inclusive as que falharam.
+- `canais`: canais criados.
+- `publicacoes`: canal, texto e timestamp de cada mensagem publicada.
+- `mensagens`: tudo o que o servidor recebeu dos bots e respondeu.
+
+O `.jsonl` (uma linha por registro) é usado onde o arquivo só cresce, para não reescrever tudo a cada
+mensagem.
+
+## Relógios e eleição (Partes 3 e 4)
+
+**Relógio lógico.** Bots e servidores têm um contador que começa em 0. Antes de enviar qualquer mensagem
+o contador soma 1 e vai junto; ao receber, o processo fica com o maior valor entre o seu e o recebido.
+
+**Heartbeat.** A cada 10 mensagens de bots o servidor manda `heartbeat` para a referência. Se a
+referência tiver removido o servidor (30 s sem heartbeat), ele se cadastra de novo e recebe um rank novo.
+
+**Eleição.** Usamos o algoritmo do valentão (bully). O servidor pede a lista à referência e manda `eleicao`
+para quem tem rank maior. Se alguém responde `OK`, ele espera até 10 s pelo anúncio do vencedor; se
+ninguém responde, ele se declara coordenador e publica o próprio nome em `servers|`. O anúncio é
+publicado duas vezes porque a primeira pode se perder logo após a conexão com o proxy. Quem recebe um
+pedido de eleição responde `OK` e começa a sua própria eleição. A eleição acontece quando o servidor sobe
+e sempre que o coordenador para de responder.
+
+**Relógio físico.** A cada 15 mensagens de bots o servidor pede a hora ao coordenador (`sincronizar`),
+soma metade do tempo de ida e volta e guarda a diferença em relação ao relógio local. Todos os
+timestamps gerados depois usam essa correção. Se o coordenador não responde em 3 s, começa uma eleição.
+A referência não devolve mais a hora no heartbeat.
+
+Um detalhe que só apareceu nos testes com servidores caindo: o ZeroMQ resolve o nome do destino dentro
+da sua própria thread de I/O, e quando um container para, o nome dele leva uns 8 s para dar erro no DNS do
+Docker. Durante esse tempo o processo inteiro fica travado e a eleição dá resultado errado. Por isso o
+compose configura `dns_opt` com timeout de 1 s nos servidores.
 
 ## Parte 5: consistência e replicação
 
 ### O problema
 
-O broker distribui as requisições entre os servidores em round-robin. Sem replicação, cada servidor
-guarda só a parte do histórico que passou por ele: um cliente que lista canais ou pede o histórico
-recebe respostas diferentes conforme o servidor que o atendeu, e se um servidor para de funcionar a
-parte dele se perde. O enunciado pede que **todos os servidores tenham todos os dados**.
+Como o broker reparte os pedidos em round-robin, sem replicação cada servidor fica só com o pedaço do
+histórico que passou por ele. Dois `listar` seguidos podem trazer listas diferentes, e se um servidor cai,
+o que só ele tinha se perde. O enunciado pede que todos os servidores tenham todos os dados.
 
-### Método escolhido: replicação ativa (escrita replicada)
+### Método escolhido
 
-Escolhemos a **replicação ativa**, um protocolo de escrita replicada visto em aula: toda operação de
-escrita é executada por **todas** as réplicas, e não só pela que recebeu o pedido. Não existe uma
-réplica primária: qualquer servidor aceita escritas e as repassa para os outros.
+Usamos **replicação ativa** (escrita replicada), vista em aula: toda escrita é executada por todas as
+réplicas, e não só por quem recebeu o pedido. Não existe réplica primária. Qualquer servidor aceita a
+escrita e a repassa para os outros.
 
-Como resolve o problema do projeto: não importa para qual servidor o broker mandou a requisição, a
-escrita chega a todos. Assim todos ficam com o mesmo conjunto de logins, canais e publicações, e a
-queda de um servidor não perde dados, porque os outros têm a cópia.
+Escolhemos esse método porque ele se encaixa no que já tínhamos. O proxy Pub/Sub já entrega uma mensagem
+a todos os servidores, então replicar é publicar mais uma mensagem. A alternativa seria primário-backup
+usando o coordenador como primário, mas aí as escritas ficariam paradas durante cada eleição e cada
+servidor teria que encaminhar os pedidos ao coordenador, o que daria bem mais trabalho em cinco linguagens.
 
-### Como foi implementado
+### Como funciona
 
-As escritas são `login`, `cadastrar` e `publicar`. Os dados replicados são os logins (usuário,
-timestamp e status), os canais e as publicações (canal, conteúdo e timestamp).
+As escritas são `login`, `cadastrar` e `publicar`. Os dados replicados são os logins, os canais e as
+publicações.
 
-1. **Difusão das escritas.** O servidor que atende a escrita grava localmente, como antes, e também a
-   publica no proxy, no tópico `replicacao|<nome do servidor de origem>`. A mensagem é a própria
-   `Mensagem` do proto, com a mesma `acao`, `canal`, `conteudo` e o `timestamp` original do cliente,
-   então o `.proto` não precisou mudar. Só escritas aceitas são difundidas: um canal repetido ou uma
-   publicação inválida não são replicados. Todos os logins são replicados, inclusive os que falharam,
-   porque o enunciado pede guardar todos os logins.
-2. **Aplicação nas outras réplicas.** Todo servidor assina o prefixo `replicacao|` e aplica as escritas
-   que chegam: registra o login, cria o canal se ainda não existir ou guarda a publicação. Ele não
-   responde a nenhum cliente e não publica de novo no canal dos bots, porque isso já foi feito pelo
-   servidor de origem.
-3. **Transferência de estado.** A difusão só alcança quem já está no ar. Um servidor que sobe depois,
-   ou que volta de uma queda, pede o estado completo a outro servidor com a ação `obter_estado`
-   (porta 5559). A resposta traz, no campo `resposta`, um JSON no mesmo formato para todas as
+1. O servidor que atende a escrita grava localmente e publica a operação no tópico
+   `replicacao|<nome do servidor>`. A mensagem é a própria `Mensagem` do proto, com a mesma ação, canal,
+   conteúdo e o timestamp original do bot, então o `.proto` não precisou mudar. Só escritas aceitas são
+   replicadas: um `cadastrar` de canal repetido, por exemplo, não é.
+2. Todos os servidores assinam `replicacao|` e aplicam o que chega: registram o login, criam o canal ou
+   guardam a publicação. Eles não respondem a nenhum bot e não publicam de novo no canal, porque isso o
+   servidor de origem já fez.
+3. Um servidor que acabou de subir, novo ou voltando de uma queda, pede o estado completo a outro
+   servidor com `obter_estado`. A resposta vem em JSON no campo `resposta`, no mesmo formato em todas as
    linguagens:
 
    ```json
-   {"canais": ["..."],
-    "logins": [{"usuario": "...", "timestamp": 0, "status": "200"}],
-    "publicacoes": [{"canal": "...", "conteudo": "...", "timestamp": 0}]}
+   {"canais": ["canal1"],
+    "logins": [{"usuario": "teste", "timestamp": 1794802162630, "status": "200"}],
+    "publicacoes": [{"canal": "canal1", "conteudo": "ola", "timestamp": 1794802162631}]}
    ```
 
-   O servidor junta esse estado com o que já tinha em disco e segue normalmente.
+   O servidor junta isso com o que já tinha em disco e só então começa a atender.
 
-### Mudanças necessárias para o método funcionar no projeto
+### O que tivemos que adaptar
 
-- **Ignorar o próprio eco.** No Pub-Sub o servidor também recebe o que ele mesmo publicou. Por isso o
-  nome do servidor de origem vai no tópico, e cada servidor descarta as mensagens com o próprio nome.
-- **Aplicar a mesma escrita mais de uma vez não duplica dados.** Cada login é identificado por
-  (usuário, timestamp) e cada publicação por (canal, conteúdo, timestamp), e um canal só é criado se
-  ainda não existir. Isso permite juntar o estado recebido com o local sem duplicar registros, inclusive
-  quando a mesma escrita chega pela difusão e pela transferência de estado.
-- **Assinar antes de pedir o estado.** Ao iniciar, o servidor primeiro assina `replicacao|` e só depois
-  pede o estado, para não perder as escritas feitas nesse meio tempo.
-- **A quem pedir o estado.** A ideia inicial era pedir sempre ao coordenador. Mas no algoritmo do
-  valentão quem acabou de subir recebe da referência o maior rank e normalmente vence a eleição, ou
-  seja, muitas vezes o coordenador seria o próprio servidor que está sem os dados. Por isso o servidor
-  pede ao coordenador quando ele é outro servidor e, se não houver ou ele não responder, ao próximo da
-  lista de servidores da referência.
+- **Ignorar o próprio eco.** No Pub/Sub quem publica também recebe a própria mensagem. Por isso o nome do
+  servidor de origem vai no tópico, e cada servidor descarta o que tem o seu nome.
+- **Não duplicar.** Um login é identificado por (usuário, timestamp) e uma publicação por (canal, texto,
+  timestamp). Um canal só é criado se ainda não existir. Assim a mesma escrita pode chegar duas vezes (pela
+  replicação e pela transferência de estado) sem gerar registro repetido.
+- **Ordem na inicialização.** O servidor assina `replicacao|`, espera 1 s para a assinatura chegar ao
+  proxy (no ZeroMQ ela é assíncrona) e só então pede o estado. Assim nenhuma escrita cai no intervalo
+  entre as duas coisas.
+- **A quem pedir o estado.** A primeira ideia era pedir sempre ao coordenador, mas no algoritmo do valentão
+  quem acabou de subir recebe o maior rank e quase sempre vence a eleição, ou seja, o coordenador muitas
+  vezes seria o próprio servidor vazio. Então o servidor pede ao coordenador se ele for outro servidor e,
+  se não der, vai tentando a lista da referência.
+- **Só quem já sincronizou responde.** Nos testes, três servidores reiniciados juntos copiaram o estado
+  uns dos outros e perderam uma publicação feita naquele segundo. Agora um servidor responde
+  `obter_estado` com 503 enquanto ainda não terminou a própria sincronização, e quem pediu passa para o
+  próximo.
 
 ### Limitações
 
-- A consistência é **eventual**: uma escrita aparece nos outros servidores alguns milissegundos depois
-  de aparecer no servidor que a atendeu, e escritas concorrentes podem ser guardadas em ordem diferente
-  em servidores diferentes. Os dados ficam iguais, mas a ordem de inserção pode variar. O timestamp e o
-  relógio lógico de cada registro permitem reordenar se for necessário.
-- O Pub-Sub do ZeroMQ não garante entrega: se o proxy cair, as escritas difundidas nesse intervalo se
-  perdem para quem não as recebeu. Um servidor reiniciado recupera tudo pela transferência de estado.
-- O registro de requisições e respostas (`mensagens`) é um log de auditoria de cada servidor e não é
-  replicado. Os dados do sistema (logins, canais e publicações) são replicados.
+- A consistência é eventual: a escrita aparece nos outros servidores alguns milissegundos depois, e duas
+  escritas simultâneas podem ser gravadas em ordem diferente em servidores diferentes. O conteúdo fica
+  igual; o timestamp e o relógio lógico permitem reordenar se precisar.
+- O Pub/Sub do ZeroMQ não garante entrega. Se o proxy cair, as escritas replicadas nesse intervalo se
+  perdem para quem não as recebeu. Um servidor que reinicia recupera tudo pela transferência de estado,
+  mas um que ficou no ar o tempo todo não.
+- O arquivo `mensagens` (pedidos e respostas de cada servidor) é um log local e não é replicado.
+
+## Como testamos
+
+Além de deixar o sistema rodando e acompanhar os logs, testamos as falhas na mão:
+
+- derrubar o coordenador (`docker compose stop server-js-2`) e conferir que o próximo de maior rank foi
+  eleito e que todos passaram a sincronizar com ele;
+- subir de volta um servidor com os dados antigos e outro com a pasta apagada, e ver os dois receberem o
+  estado;
+- reiniciar vários servidores ao mesmo tempo;
+- pausar os bots e comparar os arquivos de todos os servidores (canais, logins e publicações iguais nos 10).

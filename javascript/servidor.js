@@ -5,22 +5,56 @@ import path from "path";
 import { fileURLToPath } from "url";
 import protobuf from "protobufjs";
 
-// Nome do servidor = nome do servico no docker-compose: os outros servidores usam esse nome
-// como endereco (tcp://<nome>:5559) para pedir eleicao e sincronizacao.
 const NOME_SERVIDOR = process.env.NOME_SERVIDOR || os.hostname();
 const PORTA_SERVIDORES = 5559;
+const URL_REFERENCIA = "tcp://referencia:5556";
+const HEARTBEAT_A_CADA = 10;
+const SINCRONIZAR_A_CADA = 15;
+const TEMPO_LIMITE_MS = 3000;
+const ESPERA_ANUNCIO_MS = 10000;
+const ESPERA_ASSINATURA_MS = 1000;
+const TOPICO_REPLICACAO = "replicacao|";
 
 const PASTA_CODIGO = path.dirname(fileURLToPath(import.meta.url));
-const ARQUIVO_PROTO = path.join(PASTA_CODIGO, "..", "proto", "client.proto");
-
-// cada servidor tem o seu proprio diretorio de dados: nada e compartilhado entre servidores
 const DIRETORIO = path.join(process.env.DADOS_DIR || "dados", NOME_SERVIDOR);
-await fs.mkdir(DIRETORIO, { recursive: true });
-
 const ARQUIVO_CANAIS = path.join(DIRETORIO, "canais.json");
 const ARQUIVO_LOGINS = path.join(DIRETORIO, "login.json");
 const ARQUIVO_PUBLICACOES = path.join(DIRETORIO, "publicacoes.json");
 const ARQUIVO_MENSAGENS = path.join(DIRETORIO, "mensagens.json");
+
+const proto = await protobuf.load(path.join(PASTA_CODIGO, "..", "proto", "client.proto"));
+const Mensagem = proto.lookupType("Mensagem");
+const Resposta = proto.lookupType("Resposta");
+const RespostaSub = proto.lookupType("RespostaSub");
+const RespostaReferencia = proto.lookupType("RespostaReferencia");
+
+await fs.mkdir(DIRETORIO, { recursive: true });
+
+const usuarios = (await lerJson(path.join(PASTA_CODIGO, "usuarios.json"), { usuarios: [] })).usuarios;
+const canais = await lerJson(ARQUIVO_CANAIS, { canais: [] });
+const logins = await lerJson(ARQUIVO_LOGINS, []);
+const publicacoes = await lerJson(ARQUIVO_PUBLICACOES, []);
+const mensagens = await lerJson(ARQUIVO_MENSAGENS, []);
+
+const chaveLogin = (usuario, timestamp) => JSON.stringify([usuario, Number(timestamp)]);
+const chavePublicacao = (canal, conteudo, timestamp) => JSON.stringify([canal, conteudo, Number(timestamp)]);
+const loginsVistos = new Set(logins.map(l => chaveLogin(l.usuario, l.timestamp)));
+const publicacoesVistas = new Set(publicacoes.map(p => chavePublicacao(p.canal, p.conteudo, p.timestamp)));
+
+let contador = 0;
+let offsetRelogio = 0;
+let rank = 0;
+let coordenador = "";
+let emEleicao = false;
+let anuncioRecebido = false;
+let sincronizado = false;
+
+const pubSocket = new Publisher();
+let filaPub = Promise.resolve();
+
+function log(...texto) {
+    console.log(`[${NOME_SERVIDOR}]`, ...texto);
+}
 
 async function lerJson(caminho, padrao) {
     try {
@@ -30,14 +64,6 @@ async function lerJson(caminho, padrao) {
     }
 }
 
-var usuarios = await lerJson(path.join(PASTA_CODIGO, "usuarios.json"), { usuarios: [] });
-var canais = await lerJson(ARQUIVO_CANAIS, { canais: [] });
-var logins = await lerJson(ARQUIVO_LOGINS, []);
-var publicacoes = await lerJson(ARQUIVO_PUBLICACOES, []);
-var mensagens = await lerJson(ARQUIVO_MENSAGENS, []);
-
-// os arquivos sao gravados pelo atendimento dos clientes e pela replicacao ao mesmo tempo:
-// cada arquivo tem uma fila de gravacoes para que duas escritas nao se misturem
 const filasArquivos = new Map();
 
 function salvarArquivo(caminho, dados) {
@@ -48,11 +74,70 @@ function salvarArquivo(caminho, dados) {
     return proxima;
 }
 
-// chaves do que ja esta guardado: aplicar a mesma operacao duas vezes nao duplica o registro
-const chaveLogin = (usuario, timestamp) => JSON.stringify([usuario, Number(timestamp)]);
-const chavePublicacao = (canal, conteudo, timestamp) => JSON.stringify([canal, conteudo, Number(timestamp)]);
-const loginsVistos = new Set(logins.map(l => chaveLogin(l.usuario, l.timestamp)));
-const publicacoesVistas = new Set(publicacoes.map(p => chavePublicacao(p.canal, p.conteudo, p.timestamp)));
+function agora() {
+    return Math.floor(Date.now() + offsetRelogio);
+}
+
+function proximoContador() {
+    return ++contador;
+}
+
+function atualizarContador(recebido) {
+    contador = Math.max(contador, Number(recebido));
+}
+
+function publicarNoProxy(topico, corpo) {
+    filaPub = filaPub.catch(() => {}).then(() => pubSocket.send([topico, corpo]));
+    return filaPub;
+}
+
+function decodificar(Tipo, bytes) {
+    return Tipo.toObject(Tipo.decode(bytes), { longs: Number, defaults: true });
+}
+
+function novaMensagem(acao, conteudo = NOME_SERVIDOR, canal = "") {
+    return Mensagem.encode(Mensagem.create({
+        timestamp: agora(),
+        acao: acao,
+        canal: canal,
+        conteudo: conteudo,
+        contadorMensagem: proximoContador()
+    })).finish();
+}
+
+function criarResposta(status, texto, lista = []) {
+    return {
+        status: status,
+        resposta: texto,
+        canais: lista,
+        timestamp: agora(),
+        contadorMensagem: proximoContador()
+    };
+}
+
+async function requisitar(url, acao, Tipo, conteudo = NOME_SERVIDOR) {
+    const socket = new Request({ sendTimeout: TEMPO_LIMITE_MS, receiveTimeout: TEMPO_LIMITE_MS, linger: 0 });
+    try {
+        socket.connect(url);
+        await socket.send(novaMensagem(acao, conteudo));
+        const [bytes] = await socket.receive();
+        const resposta = decodificar(Tipo, bytes);
+        atualizarContador(resposta.contadorMensagem);
+        return resposta;
+    } catch {
+        return null;
+    } finally {
+        socket.close();
+    }
+}
+
+function requisitarServidor(alvo, acao) {
+    return requisitar(`tcp://${alvo}:${PORTA_SERVIDORES}`, acao, Resposta);
+}
+
+function requisitarReferencia(acao) {
+    return requisitar(URL_REFERENCIA, acao, RespostaReferencia);
+}
 
 async function registrarLogin(usuario, timestamp, status) {
     const chave = chaveLogin(usuario, timestamp);
@@ -64,7 +149,6 @@ async function registrarLogin(usuario, timestamp, status) {
     await salvarArquivo(ARQUIVO_LOGINS, logins);
 }
 
-// devolve false se o canal ja existia
 async function registrarCanal(canal) {
     if (canais.canais.includes(canal)) {
         return false;
@@ -84,923 +168,359 @@ async function registrarPublicacao(canal, conteudo, timestamp) {
     await salvarArquivo(ARQUIVO_PUBLICACOES, publicacoes);
 }
 
-// ---------------------------------------------------------------- Parte 5: replicacao
-// Replicacao ativa: cada escrita aceita de um cliente (login, cadastrar, publicar) e aplicada
-// localmente e difundida no topico "replicacao|<servidor de origem>"; todos os servidores assinam
-// "replicacao|" e aplicam as escritas dos outros. Quem entra (ou volta) pede o estado completo a
-// outro servidor com "obter_estado".
-
-const TOPICO_REPLICACAO = "replicacao|";
-var pubReplicacao = null;
-
-async function replicar(acao, canal, conteudo, timestamp) {
-
-    contadorMensagens++;
-
-    const operacao = Mensagem.create({
-        timestamp: Number(timestamp),
-        acao: acao,
-        canal: canal,
-        conteudo: conteudo,
-        contadorMensagem: contadorMensagens
-    });
-
-    await pubReplicacao.send([
-        TOPICO_REPLICACAO + NOME_SERVIDOR,
-        Mensagem.encode(operacao).finish()
-    ]);
+async function tentarRank() {
+    const resposta = await requisitarReferencia("consultar_rank");
+    return resposta !== null && resposta.status === "200" ? resposta.rank : null;
 }
 
-// aplica uma escrita feita por outro servidor (sem responder cliente nem republicar no canal)
-async function aplicarOperacao(operacao) {
-
-    if (operacao.acao === "login") {
-        const status = usuarios.usuarios.includes(operacao.conteudo) ? "200" : "404";
-        await registrarLogin(operacao.conteudo, operacao.timestamp, status);
-    }
-
-    else if (operacao.acao === "cadastrar") {
-        await registrarCanal(operacao.conteudo);
-    }
-
-    else if (operacao.acao === "publicar") {
-        await registrarPublicacao(operacao.canal, operacao.conteudo, operacao.timestamp);
-    }
-}
-
-async function ouvirReplicacao(subReplicacao) {
-
-    for await (const [topico, msg] of subReplicacao) {
-
-        try {
-
-            const origem = topico.toString().slice(TOPICO_REPLICACAO.length);
-
-            if (origem === NOME_SERVIDOR) {
-                continue;  // eco da propria escrita: ja foi aplicada
-            }
-
-            const operacao = Mensagem.toObject(Mensagem.decode(msg), {
-                longs: Number,
-                defaults: true
-            });
-
-            contadorMensagens = Math.max(contadorMensagens, Number(operacao.contadorMensagem));
-
-            await aplicarOperacao(operacao);
-
-            console.log("Replicado de " + origem + ":", operacao.acao, operacao.canal, operacao.conteudo);
-
-        } catch (error) {
-
-            console.log("Erro ao aplicar replicação:", error);
+async function heartbeat() {
+    const resposta = await requisitarReferencia("heartbeat");
+    if (resposta === null) {
+        log("heartbeat sem resposta da referência");
+    } else if (resposta.status === "200") {
+        log("heartbeat confirmado");
+    } else {
+        const novo = await tentarRank();
+        if (novo !== null) {
+            rank = novo;
+            log("recadastrado na referência, rank", rank);
         }
     }
 }
 
-function exportarEstado() {
-
-    return JSON.stringify({
-        canais: canais.canais,
-        logins: logins,
-        publicacoes: publicacoes
-    });
-}
-
-// junta o estado recebido com o local (sem duplicar)
-async function importarEstado(texto) {
-
-    const estado = JSON.parse(texto);
-
-    for (const canal of estado.canais || []) {
-        await registrarCanal(canal);
-    }
-
-    for (const l of estado.logins || []) {
-        await registrarLogin(l.usuario, l.timestamp, l.status || "");
-    }
-
-    for (const p of estado.publicacoes || []) {
-        await registrarPublicacao(p.canal, p.conteudo, p.timestamp);
-    }
-}
-
-// pede o estado ao coordenador (se for outro servidor) ou ao proximo servidor da lista
-async function obterEstadoInicial() {
-
-    const servidores = await listarServidores();
-
-    const candidatos = [];
-
-    if (servidorEleito !== "" && servidorEleito !== NOME_SERVIDOR) {
-        candidatos.push(servidorEleito);
-    }
-
-    for (const s of servidores) {
-        if (s.nome !== NOME_SERVIDOR && s.nome !== servidorEleito) {
-            candidatos.push(s.nome);
-        }
-    }
-
-    for (const alvo of candidatos) {
-
-        contadorMensagens++;
-
-        const payload = Mensagem.create({
-            timestamp: Date.now() + offsetRelogio,
-            acao: "obter_estado",
-            conteudo: NOME_SERVIDOR,
-            contadorMensagem: contadorMensagens
-        });
-
-        const objeto = await requisitar(
-            "tcp://" + alvo + ":" + PORTA_SERVIDORES,
-            payload,
-            Resposta
-        );
-
-        if (objeto !== null && objeto.status === "200") {
-
-            await importarEstado(objeto.resposta);
-
-            console.log(
-                "Estado recebido de " + alvo + ":",
-                canais.canais.length, "canais,",
-                logins.length, "logins,",
-                publicacoes.length, "publicacoes"
-            );
-            return;
-        }
-    }
-
-    console.log("Nenhum outro servidor respondeu: mantendo os dados locais");
-}
-
-var contadorMensagens = 0;
-
-var mensagensRecebidas = 0;
-
-var offsetRelogio = 0;
-
-const TEMPO_LIMITE_MS = 3000;
-
-var Mensagem;
-var Resposta;
-var RespostaSub;
-var RespostaReferencia;
-
-var rankServidor = 0;
-
-var servidorEleito = "";
-
-var emEleicao = false;
-var anuncioRecebido = false;
-
-async function run() {
-
-    const root = await protobuf.load(ARQUIVO_PROTO);
-
-    Mensagem = root.lookupType("Mensagem");
-    Resposta = root.lookupType("Resposta");
-    RespostaSub = root.lookupType("RespostaSub");
-    RespostaReferencia = root.lookupType("RespostaReferencia");
-
-    const responder = new Reply();
-
-    const respostaServidores = new Reply();
-
-    const pubSocket = new Publisher();
-
-    // o PUB e usado ao mesmo tempo pelas requisicoes, pela eleicao e pela replicacao, e o
-    // zeromq.js nao aceita dois envios simultaneos no mesmo socket: os envios entram numa fila
-    let filaPub = Promise.resolve();
-    const pub = {
-        send: (frames) => (filaPub = filaPub.catch(() => {}).then(() => pubSocket.send(frames)))
-    };
-
-    const sub = new Subscriber();
-
-    const subReplicacao = new Subscriber();
-
-    const referencia = new Request();
-
-    pubSocket.connect("tcp://proxy:5557");
-
-    sub.connect("tcp://proxy:5558");
-    sub.subscribe("servers");
-
-    // Parte 5: assina a replicacao antes de pedir o estado, para nao perder escritas no meio
-    subReplicacao.connect("tcp://proxy:5558");
-    subReplicacao.subscribe(TOPICO_REPLICACAO);
-    ouvirReplicacao(subReplicacao);
-    pubReplicacao = pub;
-
-    responder.connect("tcp://broker:5560");
-
-    await respostaServidores.bind("tcp://*:" + PORTA_SERVIDORES);
-
-    referencia.connect("tcp://referencia:5556");
-
-    console.log("Servidor conectado ao broker...");
-    console.log("Servidor conectado ao proxy...");
-    console.log("Servidor conectado à referência...");
-
-    rankServidor = await consultarRank(
-        referencia,
-        Mensagem,
-        RespostaReferencia
-    );
-
-    console.log("Rank do servidor:", rankServidor);
-
-    ouvirAnuncios(sub);
-    atenderServidores(respostaServidores, pub);
-
-    await obterEstadoInicial();
-
-    iniciarEleicao(pub);
-
-    for await (const [request] of responder) {
-
-        try {
-
-            const requisicao = Mensagem.decode(request);
-
-            const objetoOriginal = Mensagem.toObject(requisicao, {
-                longs: Number,
-                enums: String,
-                bytes: String,
-                defaults: true
-            });
-
-            contadorMensagens = Math.max(
-                contadorMensagens,
-                Number(objetoOriginal.contadorMensagem)
-            );
-
-            mensagensRecebidas++;
-
-            if (mensagensRecebidas % 10 === 0) {
-
-                await heartbeat(
-                    referencia,
-                    Mensagem,
-                    RespostaReferencia
-                );
-            }
-
-            if (mensagensRecebidas % 15 === 0) {
-
-                await sincronizarComServidorEleito(pub);
-            }
-
-            mensagens.push({
-                usuario: "cliente",
-                acao: objetoOriginal.acao,
-                conteudo: objetoOriginal.conteudo,
-                canal: objetoOriginal.canal,
-                timestamp: objetoOriginal.timestamp,
-                contadorMensagem: objetoOriginal.contadorMensagem
-            });
-
-            await salvarArquivo(ARQUIVO_MENSAGENS, mensagens);
-
-            // LOGIN
-            if (objetoOriginal.acao === "login") {
-
-                if (usuarios.usuarios.includes(objetoOriginal.conteudo)) {
-
-                    const payload = criarResposta(
-                        Resposta,
-                        "200",
-                        "Login realizado com sucesso!"
-                    );
-
-                    await registrarLogin(objetoOriginal.conteudo, objetoOriginal.timestamp, "200");
-
-                    await enviarResposta(responder, payload);
-
-                    mensagens.push({
-                        usuario: "servidor",
-                        status: "200",
-                        conteudo: "Login realizado com sucesso!"
-                    });
-
-                } else {
-
-                    const payload = criarResposta(
-                        Resposta,
-                        "404",
-                        "Nome de usuario incorreto!"
-                    );
-
-                    await registrarLogin(objetoOriginal.conteudo, objetoOriginal.timestamp, "404");
-
-                    await enviarResposta(responder, payload);
-
-                    mensagens.push({
-                        usuario: "servidor",
-                        status: "404",
-                        conteudo: "Nome de usuario incorreto!"
-                    });
-                }
-
-                await replicar("login", "", objetoOriginal.conteudo, objetoOriginal.timestamp);
-
-                await salvarMensagens();
-            }
-
-            // LISTAR CANAIS
-            else if (objetoOriginal.acao === "listar") {
-
-                const payload = criarResposta(
-                    Resposta,
-                    "200",
-                    "Canais listados",
-                    canais.canais
-                );
-
-                await enviarResposta(responder, payload);
-
-                mensagens.push({
-                    usuario: "servidor",
-                    status: "200",
-                    conteudo: "Canais listados",
-                    canais: canais.canais
-                });
-
-                await salvarMensagens();
-            }
-
-            // CADASTRAR CANAL
-            else if (objetoOriginal.acao === "cadastrar") {
-
-                if (await registrarCanal(objetoOriginal.conteudo)) {
-
-                    await replicar("cadastrar", "", objetoOriginal.conteudo, objetoOriginal.timestamp);
-
-                    const payload = criarResposta(
-                        Resposta,
-                        "200",
-                        "Canal " + objetoOriginal.conteudo + " cadastrado com sucesso!"
-                    );
-
-                    await enviarResposta(responder, payload);
-
-                    mensagens.push({
-                        usuario: "servidor",
-                        status: "200",
-                        conteudo: "Canal " + objetoOriginal.conteudo + " cadastrado com sucesso!"
-                    });
-
-                } else {
-
-                    const payload = criarResposta(
-                        Resposta,
-                        "404",
-                        "Canal já existe!"
-                    );
-
-                    await enviarResposta(responder, payload);
-
-                    mensagens.push({
-                        usuario: "servidor",
-                        status: "404",
-                        conteudo: "Canal já existe!"
-                    });
-                }
-
-                await salvarMensagens();
-            }
-
-            // PUBLICAR MENSAGEM
-            else if (objetoOriginal.acao === "publicar") {
-
-                try {
-
-                    await publicar(
-                        pub,
-                        objetoOriginal,
-                        RespostaSub
-                    );
-
-                    const payload = criarResposta(
-                        Resposta,
-                        "200",
-                        "Mensagem publicada no canal " +
-                        objetoOriginal.canal + " com sucesso!"
-                    );
-
-                    await enviarResposta(responder, payload);
-
-                    mensagens.push({
-                        usuario: "servidor",
-                        status: "200",
-                        conteudo: "Mensagem publicada no canal " +
-                        objetoOriginal.canal + " com sucesso!"
-                    });
-
-                } catch (error) {
-
-                    console.log("Erro ao publicar:", error);
-
-                    const payload = criarResposta(
-                        Resposta,
-                        "500",
-                        "Erro ao publicar mensagem!"
-                    );
-
-                    await enviarResposta(responder, payload);
-
-                    mensagens.push({
-                        usuario: "servidor",
-                        status: "500",
-                        conteudo: "Erro ao publicar mensagem!"
-                    });
-                }
-
-                await salvarMensagens();
-            }
-
-        } catch (error) {
-
-            console.log("Erro ao processar mensagem:", error);
-
-            const payload = criarResposta(
-                Resposta,
-                "500",
-                "Erro interno no servidor!"
-            );
-
-            await enviarResposta(responder, payload);
-        }
-    }
-}
-
-function criarResposta(Resposta, status, resposta, listaCanais = []) {
-
-    contadorMensagens++;
-
-    return Resposta.create({
-        status: status,
-        resposta: resposta,
-        canais: listaCanais,
-        timestamp: Date.now() + offsetRelogio,
-        contadorMensagem: contadorMensagens
-    });
-}
-
-async function enviarResposta(socket, payload) {
-
-    await socket.send(
-        RespostaEncode(payload)
-    );
-}
-
-function RespostaEncode(payload) {
-    return Resposta.encode(payload).finish();
-}
-
-// Salva histórico de mensagens
-async function salvarMensagens() {
-
-    await salvarArquivo(ARQUIVO_MENSAGENS, mensagens);
-}
-
-async function requisitar(url, payload, Tipo) {
-
-    const socket = new Request({
-        sendTimeout: TEMPO_LIMITE_MS,
-        receiveTimeout: TEMPO_LIMITE_MS,
-        linger: 0
-    });
-
-    try {
-
-        socket.connect(url);
-
-        await socket.send(
-            Mensagem.encode(payload).finish()
-        );
-
-        const [reply] = await socket.receive();
-
-        const objeto = Tipo.toObject(Tipo.decode(reply), {
-            longs: Number,
-            defaults: true
-        });
-
-        contadorMensagens = Math.max(
-            contadorMensagens,
-            Number(objeto.contadorMensagem)
-        );
-
-        return objeto;
-
-    } catch (error) {
-
-        return null;
-
-    } finally {
-
-        socket.close();
-    }
-}
-
-async function consultarRank(
-    requester,
-    Mensagem,
-    RespostaReferencia
-) {
-
-    contadorMensagens++;
-
-    const payload = Mensagem.create({
-        timestamp: Date.now() + offsetRelogio,
-        acao: "consultar_rank",
-        conteudo: NOME_SERVIDOR,
-        contadorMensagem: contadorMensagens
-    });
-
-    await requester.send(
-        Mensagem.encode(payload).finish()
-    );
-
-    const [reply] = await requester.receive();
-
-    const resposta = RespostaReferencia.decode(reply);
-
-    const objeto = RespostaReferencia.toObject(resposta, {
-        defaults: true
-    });
-
-    contadorMensagens = Math.max(
-        contadorMensagens,
-        Number(objeto.contadorMensagem)
-    );
-
-    if (objeto.status !== "200") {
-        throw new Error(objeto.resposta);
-    }
-
-    return objeto.rank;
-}
-
-async function listarServidores() {
-
-    contadorMensagens++;
-
-    const payload = Mensagem.create({
-        timestamp: Date.now() + offsetRelogio,
-        acao: "listar_servidores",
-        conteudo: NOME_SERVIDOR,
-        contadorMensagem: contadorMensagens
-    });
-
-    const objeto = await requisitar(
-        "tcp://referencia:5556",
-        payload,
-        RespostaReferencia
-    );
-
-    if (objeto === null || objeto.status !== "200") {
-        return [];
-    }
-
-    return objeto.servidores;
-}
-
-async function iniciarEleicao(pub) {
-
+async function iniciarEleicao() {
     if (emEleicao) {
         return;
     }
-
     emEleicao = true;
     anuncioRecebido = false;
-
-    console.log("Iniciando eleição...");
+    log("iniciando eleição...");
 
     try {
-
-        const servidores = await listarServidores();
-
-        const maiores = servidores.filter(
-            s => s.rank > rankServidor && s.nome !== NOME_SERVIDOR
-        );
+        const lista = await requisitarReferencia("listar_servidores");
+        const maiores = (lista?.servidores || []).filter(s => s.rank > rank && s.nome !== NOME_SERVIDOR);
 
         let algumRespondeu = false;
-
         for (const alvo of maiores) {
-
-            contadorMensagens++;
-
-            const payload = Mensagem.create({
-                timestamp: Date.now() + offsetRelogio,
-                acao: "eleicao",
-                conteudo: NOME_SERVIDOR,
-                contadorMensagem: contadorMensagens
-            });
-
-            const objeto = await requisitar(
-                "tcp://" + alvo.nome + ":" + PORTA_SERVIDORES,
-                payload,
-                Resposta
-            );
-
-            if (objeto !== null && objeto.resposta === "OK") {
+            const resposta = await requisitarServidor(alvo.nome, "eleicao");
+            if (resposta !== null && resposta.resposta === "OK") {
                 algumRespondeu = true;
             }
         }
 
         if (algumRespondeu) {
-
-            console.log("Servidor de rank maior assumiu a eleição. Aguardando anúncio...");
-
+            log("servidor de rank maior assumiu a eleição; aguardando anúncio...");
             setTimeout(() => {
                 if (!anuncioRecebido) {
-                    iniciarEleicao(pub);
+                    log("anúncio não chegou; refazendo eleição");
+                    iniciarEleicao();
                 }
-            }, 10000);
-
+            }, ESPERA_ANUNCIO_MS);
         } else {
-
-            servidorEleito = NOME_SERVIDOR;
-            offsetRelogio = 0;
-            anuncioRecebido = true;
-
-            console.log("Servidor eleito como coordenador:", servidorEleito);
-
-            await anunciarCoordenador(pub);
+            await tornarSeCoordenador();
         }
-
     } finally {
-
         emEleicao = false;
     }
 }
 
-async function anunciarCoordenador(pub) {
+async function tornarSeCoordenador() {
+    coordenador = NOME_SERVIDOR;
+    offsetRelogio = 0;
+    anuncioRecebido = true;
+    log(`eleito coordenador (rank ${rank})`);
 
-    contadorMensagens++;
-
-    const payloadSub = RespostaSub.create({
-        timestampEnvio: Date.now() + offsetRelogio,
-        canal: "servers",
-        conteudo: NOME_SERVIDOR,
-        contadorMensagem: contadorMensagens
-    });
-
-    await pub.send([
-        "servers|",
-        RespostaSub.encode(payloadSub).finish()
-    ]);
+    for (let i = 0; i < 2; i++) {
+        const anuncio = RespostaSub.encode(RespostaSub.create({
+            timestampEnvio: agora(),
+            canal: "servers",
+            conteudo: NOME_SERVIDOR,
+            contadorMensagem: proximoContador()
+        })).finish();
+        await publicarNoProxy("servers|", anuncio);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+    }
 }
 
-async function ouvirAnuncios(sub) {
+async function ouvirAnuncios() {
+    const sub = new Subscriber();
+    sub.connect("tcp://proxy:5558");
+    sub.subscribe("servers|");
 
-    for await (const [topico, msg] of sub) {
-
-        try {
-
-            const objeto = RespostaSub.toObject(RespostaSub.decode(msg), {
-                longs: Number,
-                defaults: true
-            });
-
-            contadorMensagens = Math.max(
-                contadorMensagens,
-                Number(objeto.contadorMensagem)
-            );
-
-            servidorEleito = objeto.conteudo;
-            anuncioRecebido = true;
-
-            console.log("Novo coordenador anunciado:", servidorEleito);
-
-        } catch (error) {
-
-            console.log("Erro ao processar anúncio:", error);
+    for await (const [, corpo] of sub) {
+        const anuncio = decodificar(RespostaSub, corpo);
+        atualizarContador(anuncio.contadorMensagem);
+        const mudou = coordenador !== anuncio.conteudo;
+        coordenador = anuncio.conteudo;
+        anuncioRecebido = true;
+        if (mudou) {
+            log("novo coordenador anunciado:", coordenador);
         }
     }
 }
 
-async function atenderServidores(socket, pub) {
-
-    for await (const [request] of socket) {
-
-        try {
-
-            const requisicao = Mensagem.decode(request);
-
-            const objeto = Mensagem.toObject(requisicao, {
-                longs: Number,
-                defaults: true
-            });
-
-            contadorMensagens = Math.max(
-                contadorMensagens,
-                Number(objeto.contadorMensagem)
-            );
-
-            // Parte 5: transferencia de estado para um servidor que esta entrando
-            if (objeto.acao === "obter_estado") {
-
-                const payload = criarResposta(Resposta, "200", exportarEstado());
-
-                await enviarResposta(socket, payload);
-
-                console.log("Estado enviado para", objeto.conteudo);
-            }
-
-            else if (objeto.acao === "eleicao") {
-
-                const payload = criarResposta(Resposta, "200", "OK");
-
-                await enviarResposta(socket, payload);
-
-                iniciarEleicao(pub);
-            }
-
-            else if (objeto.acao === "sincronizar") {
-
-                if (servidorEleito === NOME_SERVIDOR) {
-
-                    const payload = criarResposta(
-                        Resposta,
-                        "200",
-                        "Hora correta"
-                    );
-
-                    await enviarResposta(socket, payload);
-
-                } else {
-
-                    const payload = criarResposta(
-                        Resposta,
-                        "400",
-                        "Não sou o coordenador!"
-                    );
-
-                    await enviarResposta(socket, payload);
-                }
-            }
-
-            else {
-
-                const payload = criarResposta(
-                    Resposta,
-                    "400",
-                    "Ação desconhecida!"
-                );
-
-                await enviarResposta(socket, payload);
-            }
-
-        } catch (error) {
-
-            console.log("Erro ao atender servidor:", error);
-
-            const payload = criarResposta(
-                Resposta,
-                "500",
-                "Erro interno no servidor!"
-            );
-
-            await enviarResposta(socket, payload);
-        }
-    }
-}
-
-async function sincronizarComServidorEleito(pub) {
-
-    if (servidorEleito === "") {
-        iniciarEleicao(pub);
+async function sincronizarRelogio() {
+    const alvo = coordenador;
+    if (alvo === "") {
+        iniciarEleicao();
         return;
     }
-
-    if (servidorEleito === NOME_SERVIDOR) {
-        console.log("Este servidor é o coordenador. Relógio mantido.");
+    if (alvo === NOME_SERVIDOR) {
+        log("sou o coordenador: relógio mantido");
         return;
     }
-
-    contadorMensagens++;
-
-    const payload = Mensagem.create({
-        timestamp: Date.now() + offsetRelogio,
-        acao: "sincronizar",
-        conteudo: NOME_SERVIDOR,
-        contadorMensagem: contadorMensagens
-    });
 
     const t0 = Date.now();
-
-    const objeto = await requisitar(
-        "tcp://" + servidorEleito + ":" + PORTA_SERVIDORES,
-        payload,
-        Resposta
-    );
-
+    const resposta = await requisitarServidor(alvo, "sincronizar");
     const t1 = Date.now();
 
-    if (objeto === null || objeto.status !== "200") {
-
-        console.log("Coordenador indisponível. Iniciando eleição...");
-
-        iniciarEleicao(pub);
+    if (resposta === null || resposta.status !== "200") {
+        log("coordenador indisponível; iniciando eleição");
+        iniciarEleicao();
         return;
     }
 
-    const horaCoordenador = Number(objeto.timestamp) + (t1 - t0) / 2;
-
-    offsetRelogio = horaCoordenador - t1;
-
-    console.log(
-        "Relógio sincronizado com " + servidorEleito + ":",
-        new Date(Date.now() + offsetRelogio).toISOString()
-    );
+    offsetRelogio = Number(resposta.timestamp) + (t1 - t0) / 2 - t1;
+    log(`relógio sincronizado com ${alvo} (offset ${Math.round(offsetRelogio)} ms)`);
 }
 
-async function heartbeat(
-    requester,
-    Mensagem,
-    RespostaReferencia
-) {
+async function atenderServidores() {
+    const socket = new Reply();
+    await socket.bind(`tcp://*:${PORTA_SERVIDORES}`);
 
-    contadorMensagens++;
+    for await (const [bytes] of socket) {
+        let resposta;
+        let iniciar = false;
+        try {
+            const pedido = decodificar(Mensagem, bytes);
+            atualizarContador(pedido.contadorMensagem);
 
-    const payload = Mensagem.create({
-        timestamp: Date.now() + offsetRelogio,
-        acao: "heartbeat",
-        conteudo: NOME_SERVIDOR,
-        contadorMensagem: contadorMensagens
-    });
+            if (pedido.acao === "obter_estado" && !sincronizado) {
+                resposta = criarResposta("503", "Servidor ainda sincronizando");
+            } else if (pedido.acao === "obter_estado") {
+                resposta = criarResposta("200", exportarEstado());
+                log("estado enviado para", pedido.conteudo);
+            } else if (pedido.acao === "eleicao") {
+                resposta = criarResposta("200", "OK");
+                iniciar = true;
+            } else if (pedido.acao === "sincronizar") {
+                resposta = coordenador === NOME_SERVIDOR
+                    ? criarResposta("200", "Hora correta")
+                    : criarResposta("400", "Não sou o coordenador!");
+            } else {
+                resposta = criarResposta("400", "Ação desconhecida!");
+            }
+        } catch (erro) {
+            log("erro ao atender servidor:", erro);
+            resposta = criarResposta("500", "Erro interno no servidor!");
+        }
 
-    await requester.send(
-        Mensagem.encode(payload).finish()
-    );
+        await socket.send(Resposta.encode(Resposta.create(resposta)).finish());
+        if (iniciar) {
+            iniciarEleicao();
+        }
+    }
+}
 
-    const [reply] = await requester.receive();
+async function replicar(acao, canal, conteudo, timestamp) {
+    const operacao = Mensagem.encode(Mensagem.create({
+        timestamp: Number(timestamp),
+        acao: acao,
+        canal: canal,
+        conteudo: conteudo,
+        contadorMensagem: proximoContador()
+    })).finish();
+    await publicarNoProxy(TOPICO_REPLICACAO + NOME_SERVIDOR, operacao);
+}
 
-    const resposta = RespostaReferencia.decode(reply);
+async function aplicarOperacao(operacao) {
+    if (operacao.acao === "login") {
+        const status = usuarios.includes(operacao.conteudo) ? "200" : "404";
+        await registrarLogin(operacao.conteudo, operacao.timestamp, status);
+    } else if (operacao.acao === "cadastrar") {
+        await registrarCanal(operacao.conteudo);
+    } else if (operacao.acao === "publicar") {
+        await registrarPublicacao(operacao.canal, operacao.conteudo, operacao.timestamp);
+    }
+}
 
-    const objeto = RespostaReferencia.toObject(resposta, {
-        defaults: true
-    });
+async function ouvirReplicacao(sub) {
+    for await (const [topico, corpo] of sub) {
+        const origem = topico.toString().slice(TOPICO_REPLICACAO.length);
+        if (origem === NOME_SERVIDOR) {
+            continue;
+        }
+        try {
+            const operacao = decodificar(Mensagem, corpo);
+            atualizarContador(operacao.contadorMensagem);
+            await aplicarOperacao(operacao);
+            log(`replicado de ${origem}:`, operacao.acao, operacao.canal, operacao.conteudo);
+        } catch (erro) {
+            log("erro ao aplicar replicação:", erro);
+        }
+    }
+}
 
-    contadorMensagens = Math.max(
-        contadorMensagens,
-        Number(objeto.contadorMensagem)
-    );
+function exportarEstado() {
+    return JSON.stringify({ canais: canais.canais, logins: logins, publicacoes: publicacoes });
+}
 
-    if (objeto.status === "200") {
+async function importarEstado(texto) {
+    const estado = JSON.parse(texto);
+    for (const canal of estado.canais || []) {
+        await registrarCanal(canal);
+    }
+    for (const l of estado.logins || []) {
+        await registrarLogin(l.usuario, l.timestamp, l.status || "");
+    }
+    for (const p of estado.publicacoes || []) {
+        await registrarPublicacao(p.canal, p.conteudo, p.timestamp);
+    }
+}
 
-        console.log("Heartbeat confirmado.");
-
-    } else {
-
-        // a referencia removeu este servidor (ficou muito tempo sem heartbeat): cadastra de novo
-        console.log("Erro no heartbeat:", objeto.resposta);
-
-        rankServidor = await consultarRank(requester, Mensagem, RespostaReferencia);
-
-        console.log("Recadastrado na referência, rank", rankServidor);
+async function obterEstadoInicial() {
+    const lista = await requisitarReferencia("listar_servidores");
+    const candidatos = [];
+    if (coordenador !== "" && coordenador !== NOME_SERVIDOR) {
+        candidatos.push(coordenador);
+    }
+    for (const s of lista?.servidores || []) {
+        if (s.nome !== NOME_SERVIDOR && s.nome !== coordenador) {
+            candidatos.push(s.nome);
+        }
     }
 
-    return objeto;
+    for (const alvo of candidatos) {
+        const resposta = await requisitarServidor(alvo, "obter_estado");
+        if (resposta !== null && resposta.status === "200") {
+            await importarEstado(resposta.resposta);
+            log(`estado recebido de ${alvo}: ${canais.canais.length} canais, ${logins.length} logins, ${publicacoes.length} publicações`);
+            return;
+        }
+    }
+    log("nenhum outro servidor respondeu: mantendo os dados locais");
 }
 
-// publica uma vez no canal (topico "<canal>|"); o bot e quem manda 10 mensagens por rodada
-async function publicar(pub, objetoOriginal, RespostaSub) {
+async function tratarLogin(req) {
+    const usuario = req.conteudo.trim();
+    const resposta = usuarios.includes(usuario)
+        ? criarResposta("200", "Login realizado com sucesso!")
+        : criarResposta("404", "Nome de usuario incorreto!");
 
-    contadorMensagens++;
-
-    const payloadSub = RespostaSub.create({
-        timestampEnvio: Date.now() + offsetRelogio,
-        canal: objetoOriginal.canal,
-        conteudo: objetoOriginal.conteudo,
-        contadorMensagem: contadorMensagens
-    });
-
-    await pub.send([
-        objetoOriginal.canal + "|",
-        RespostaSub.encode(payloadSub).finish()
-    ]);
-
-    await registrarPublicacao(objetoOriginal.canal, objetoOriginal.conteudo, objetoOriginal.timestamp);
-
-    await replicar("publicar", objetoOriginal.canal, objetoOriginal.conteudo, objetoOriginal.timestamp);
-
-    console.log(
-        "Mensagem publicada:",
-        objetoOriginal.conteudo
-    );
+    await registrarLogin(usuario, req.timestamp, resposta.status);
+    await replicar("login", "", usuario, req.timestamp);
+    return resposta;
 }
 
-run().catch(error => {
-    console.error("Erro ao iniciar servidor:", error);
+function tratarListar() {
+    return criarResposta("200", "Canais listados", [...canais.canais]);
+}
+
+async function tratarCadastrar(req) {
+    const canal = req.conteudo.trim();
+    if (canal === "" || canal.length > 50 || canal.includes("|")) {
+        return criarResposta("400", "Nome de canal invalido!");
+    }
+    if (!(await registrarCanal(canal))) {
+        return criarResposta("404", "Canal já existe!");
+    }
+
+    await replicar("cadastrar", "", canal, req.timestamp);
+    return criarResposta("200", `Canal ${canal} cadastrado com sucesso!`);
+}
+
+async function tratarPublicar(req) {
+    const canal = req.canal.trim();
+    if (canal === "" || req.conteudo === "") {
+        return criarResposta("400", "Canal e mensagem sao obrigatorios!");
+    }
+
+    const publicacao = RespostaSub.encode(RespostaSub.create({
+        timestampEnvio: agora(),
+        canal: canal,
+        conteudo: req.conteudo,
+        contadorMensagem: proximoContador()
+    })).finish();
+    await publicarNoProxy(`${canal}|`, publicacao);
+
+    await registrarPublicacao(canal, req.conteudo, req.timestamp);
+    await replicar("publicar", canal, req.conteudo, req.timestamp);
+    return criarResposta("200", `Mensagem publicada no canal ${canal} com sucesso!`);
+}
+
+const ACOES = {
+    login: tratarLogin,
+    listar: tratarListar,
+    cadastrar: tratarCadastrar,
+    publicar: tratarPublicar
+};
+
+async function atenderClientes() {
+    const socket = new Reply();
+    socket.connect("tcp://broker:5560");
+
+    let recebidas = 0;
+    for await (const [bytes] of socket) {
+        let resposta;
+        try {
+            const req = decodificar(Mensagem, bytes);
+            atualizarContador(req.contadorMensagem);
+            log(`recebido: ${req.acao} canal=${req.canal} conteudo=${req.conteudo} timestamp=${req.timestamp} contador=${req.contadorMensagem}`);
+            mensagens.push({ usuario: "cliente", ...req });
+
+            const tratar = ACOES[req.acao];
+            resposta = tratar ? await tratar(req) : criarResposta("400", "Ação desconhecida!");
+        } catch (erro) {
+            log("erro ao processar mensagem:", erro);
+            resposta = criarResposta("500", "Erro interno no servidor!");
+        }
+
+        log(`enviado: ${resposta.status} ${resposta.resposta} timestamp=${resposta.timestamp} contador=${resposta.contadorMensagem}`);
+        await socket.send(Resposta.encode(Resposta.create(resposta)).finish());
+
+        mensagens.push({ usuario: "servidor", ...resposta });
+        await salvarArquivo(ARQUIVO_MENSAGENS, mensagens);
+
+        recebidas++;
+        if (recebidas % HEARTBEAT_A_CADA === 0) {
+            await heartbeat();
+        }
+        if (recebidas % SINCRONIZAR_A_CADA === 0) {
+            await sincronizarRelogio();
+        }
+    }
+}
+
+async function main() {
+    log("dados em", DIRETORIO);
+    pubSocket.connect("tcp://proxy:5557");
+
+    const subReplicacao = new Subscriber();
+    subReplicacao.connect("tcp://proxy:5558");
+    subReplicacao.subscribe(TOPICO_REPLICACAO);
+    ouvirReplicacao(subReplicacao);
+
+    ouvirAnuncios();
+    atenderServidores();
+
+    let inicial;
+    while ((inicial = await tentarRank()) === null) {
+        log("aguardando o serviço de referência...");
+        await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    rank = inicial;
+    log("rank", rank);
+
+    await new Promise(resolve => setTimeout(resolve, ESPERA_ASSINATURA_MS));
+    await obterEstadoInicial();
+    sincronizado = true;
+    iniciarEleicao();
+    await atenderClientes();
+}
+
+main().catch(erro => {
+    console.error("Erro ao iniciar servidor:", erro);
+    process.exit(1);
 });
 
-process.on("SIGINT", function () {
-    process.exit(0);
-});
+process.on("SIGINT", () => process.exit(0));

@@ -1,4 +1,3 @@
-# contexto de build: raiz do repositorio (usa proto/client.proto compartilhado)
 FROM python:3.13-slim AS build
 
 WORKDIR /src

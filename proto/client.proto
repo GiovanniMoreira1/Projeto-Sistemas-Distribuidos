@@ -1,13 +1,9 @@
 syntax = "proto3";
 
-// Contrato unico de comunicacao do grupo: todas as linguagens geram o codigo a partir deste arquivo.
-// As opcoes abaixo so afetam a linguagem correspondente e sao ignoradas pelas outras.
 option csharp_namespace = "ChatCSharp.Gen";
 option java_multiple_files = true;
 option java_package = "sd.projeto.protos";
 
-// requisicao: cliente -> servidor, servidor -> referencia, servidor -> servidor
-// e operacoes replicadas no topico "replicacao|<servidor de origem>"
 message Mensagem {
   double timestamp = 1;
   string acao = 2;
@@ -16,7 +12,6 @@ message Mensagem {
   int32 contadorMensagem = 5;
 }
 
-// resposta de servidor (clientes e outros servidores)
 message Resposta {
   string status = 1;
   string resposta = 2;
@@ -25,7 +20,6 @@ message Resposta {
   double timestamp = 5;
 }
 
-// publicacao nos canais e anuncio do coordenador (topico "servers|")
 message RespostaSub {
   double timestampEnvio = 1;
   string canal = 2;
@@ -39,7 +33,6 @@ message ServidorInfo {
   int32 rank = 2;
 }
 
-// resposta do servico de referencia
 message RespostaReferencia {
   string status = 1;
   string resposta = 2;

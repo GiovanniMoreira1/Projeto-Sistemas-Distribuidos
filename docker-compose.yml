@@ -1,10 +1,3 @@
-# Sistema completo: 1 broker, 1 proxy, 1 referencia (Python) e, para cada linguagem do grupo,
-# 2 servidores e 2 clientes. Todos falam o mesmo contrato (proto/client.proto).
-#
-# O nome do servico de cada servidor = NOME_SERVIDOR = endereco usado pelos outros servidores
-# (tcp://<nome>:5559) para eleicao, sincronizacao do relogio e transferencia de estado.
-# Cada servidor grava os seus dados em ./dados/<nome-do-servidor>/ (nada e compartilhado).
-
 x-python: &python
   build: { context: ., dockerfile: python/Dockerfile }
   image: sd-python
@@ -25,9 +18,6 @@ x-servidor: &servidor
   volumes:
     - ./dados:/dados
   depends_on: [broker, proxy, referencia]
-  # Quando um servidor cai, o nome dele deixa de existir no DNS do Docker e a consulta leva ~8 s
-  # para falhar. O ZeroMQ resolve o nome dentro da sua thread de I/O, entao o processo inteiro
-  # ficaria travado esse tempo (e erraria a eleicao). Com timeout de 1 s a falha e rapida.
   dns_opt: ["timeout:1", "attempts:1"]
 
 x-cliente: &cliente
@@ -36,7 +26,6 @@ x-cliente: &cliente
   depends_on: [broker, proxy]
 
 services:
-  # ------------------------------------------------------------- infraestrutura (Python)
   broker:
     <<: *python
     command: python broker/main.py
@@ -47,7 +36,6 @@ services:
     <<: *python
     command: python referencia/main.py
 
-  # ------------------------------------------------------------- JavaScript
   server-js-1:
     <<: [*javascript, *servidor]
     command: node servidor.js
@@ -60,7 +48,6 @@ services:
     <<: [*javascript, *cliente]
     command: node client.js
 
-  # ------------------------------------------------------------- Python
   server-python-1:
     <<: [*python, *servidor]
     command: python servidor/main.py
@@ -73,7 +60,6 @@ services:
     <<: [*python, *cliente]
     command: python cliente/main.py
 
-  # ------------------------------------------------------------- Rust
   server-rust-1:
     <<: [*rust, *servidor]
     command: servidor
@@ -86,7 +72,6 @@ services:
     <<: [*rust, *cliente]
     command: client
 
-  # ------------------------------------------------------------- C#
   server-csharp-1:
     <<: [*csharp, *servidor]
     command: dotnet servidor/Servidor.dll
@@ -99,7 +84,6 @@ services:
     <<: [*csharp, *cliente]
     command: dotnet cliente/Cliente.dll
 
-  # ------------------------------------------------------------- Java
   server-java-1:
     <<: [*java, *servidor]
     command: sd.projeto.server.Server

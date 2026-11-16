@@ -26,25 +26,16 @@ import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/**
- * Servidor Java. Segue o contrato comum do grupo (proto/client.proto, portas, acoes e topicos),
- * igual aos servidores das outras linguagens:
- *   clientes  -> broker (DEALER :5560) -> este servidor (REP)
- *   publicacoes -> proxy (XSUB :5557), topico "<canal>|"
- *   referencia (REP :5556): consultar_rank, listar_servidores, heartbeat
- *   outros servidores -> este servidor (REP :5559): eleicao, sincronizar
- *   anuncio do coordenador no topico "servers|"
- */
 public class Server
 {
     private static final int PORTA_SERVIDORES = 5559;
-    private static final int HEARTBEAT_A_CADA = 10;     // mensagens de clientes (Parte 3)
-    private static final int SINCRONIZAR_A_CADA = 15;   // mensagens de clientes (Parte 4)
+    private static final int HEARTBEAT_A_CADA = 10;
+    private static final int SINCRONIZAR_A_CADA = 15;
     private static final int TEMPO_LIMITE_MS = 3000;
     private static final int ESPERA_ANUNCIO_MS = 10000;
+    private static final int ESPERA_ASSINATURA_MS = 1000;
     private static final String URL_REFERENCIA = "tcp://referencia:5556";
 
-    // relogio logico e correcao do relogio fisico, usados por varias threads
     private static final Object trava = new Object();
     private static int relogio = 0;
     private static double diferencaRelogio = 0;
@@ -52,6 +43,7 @@ public class Server
     private static volatile int rank = 0;
     private static volatile String coordenador = "";
     private static volatile boolean anuncioRecebido = false;
+    private static volatile boolean sincronizado = false;
     private static final AtomicBoolean emEleicao = new AtomicBoolean(false);
 
     private static ZContext context;
@@ -61,17 +53,14 @@ public class Server
     private static final Gson gson = new Gson();
     private static List<String> usuarios = new ArrayList<>();
 
-    // dados persistidos; a partir da Parte 5 tambem sao alterados pela thread de replicacao,
-    // por isso todo acesso e feito com synchronized (dados)
     private static final Object dados = new Object();
     private static final List<String> canais = new ArrayList<>();
     private static final List<Login> logins = new ArrayList<>();
     private static final List<Publicacao> publicacoes = new ArrayList<>();
-    // chaves do que ja esta guardado: aplicar a mesma operacao duas vezes nao duplica o registro
+
     private static final Set<String> loginsVistos = new HashSet<>();
     private static final Set<String> publicacoesVistas = new HashSet<>();
 
-    // formato dos registros na transferencia de estado (igual em todas as linguagens)
     record Login(String usuario, double timestamp, String status) {
         String chave() { return usuario + "\u0000" + timestamp; }
     }
@@ -103,7 +92,6 @@ public class Server
             iniciarThread(() -> atenderServidores(servidores));
             iniciarThread(Server::ouvirAnuncios);
 
-            // Parte 5: assina a replicacao antes de pedir o estado, para nao perder escritas no meio
             CountDownLatch replicacaoPronta = new CountDownLatch(1);
             iniciarThread(() -> ouvirReplicacao(replicacaoPronta));
             replicacaoPronta.await();
@@ -116,15 +104,14 @@ public class Server
             rank = rankInicial;
             log("cadastrado na referencia com rank " + rank);
 
+            Thread.sleep(ESPERA_ASSINATURA_MS);
             obterEstadoInicial();
+            sincronizado = true;
             iniciarEleicao();
             atenderClientes();
         }
     }
 
-    // ------------------------------------------------------------------ persistencia
-
-    // cada servidor tem o seu proprio diretorio de dados: nada e compartilhado entre servidores
     private static void prepararArquivos() throws Exception
     {
         Path diretorio = Paths.get(System.getenv().getOrDefault("DADOS_DIR", "dados"), nome);
@@ -144,7 +131,7 @@ public class Server
                 canais.addAll(Arrays.asList(conteudo.strip().split(",")));
             }
         }
-        // login.txt: timestamp,usuario,status
+
         if (Files.exists(arquivoLogins)) {
             for (String linha : Files.readAllLines(arquivoLogins)) {
                 String[] p = linha.split(",", 3);
@@ -155,7 +142,7 @@ public class Server
                 }
             }
         }
-        // publicacoes.txt: timestamp,canal,mensagem (a mensagem pode ter virgula)
+
         if (Files.exists(arquivoPublicacoes)) {
             for (String linha : Files.readAllLines(arquivoPublicacoes)) {
                 String[] p = linha.split(",", 3);
@@ -181,7 +168,6 @@ public class Server
         }
     }
 
-    // devolve false se o canal ja existia
     private static boolean registrarCanal(String canal)
     {
         synchronized (dados) {
@@ -202,7 +188,7 @@ public class Server
                 return;
             }
             publicacoes.add(pub);
-            // a mensagem vai numa linha so: quebras de linha viram espaco
+
             registrar(arquivoPublicacoes, timestamp + "," + canal + "," + conteudo.replace('\n', ' '));
         }
     }
@@ -226,8 +212,6 @@ public class Server
         }
     }
 
-    // ------------------------------------------------------------------ relogios
-
     private static double agora()
     {
         synchronized (trava) {
@@ -235,7 +219,6 @@ public class Server
         }
     }
 
-    // regra 1 do relogio logico: incrementa antes de cada envio
     private static int proximoContador()
     {
         synchronized (trava) {
@@ -243,15 +226,12 @@ public class Server
         }
     }
 
-    // regra 2: ao receber, fica com o maximo entre o local e o recebido
     private static void atualizarRelogio(int recebido)
     {
         synchronized (trava) {
             relogio = Math.max(relogio, recebido);
         }
     }
-
-    // ------------------------------------------------------------------ comunicacao
 
     private static Resposta criarResposta(String status, String texto)
     {
@@ -277,7 +257,6 @@ public class Server
         }
     }
 
-    // REQ/REP com socket novo e limite de tempo; devolve null se o destino nao responder
     private static byte[] requisitar(String url, String acao, String conteudo)
     {
         Mensagem mensagem = Mensagem.newBuilder()
@@ -298,7 +277,6 @@ public class Server
             }
             return req.recv(0);
         } catch (Exception e) {
-            // servidor que caiu: o nome some do DNS e o connect/envio falha
             return null;
         } finally {
             context.destroySocket(req);
@@ -335,8 +313,6 @@ public class Server
         }
     }
 
-    // ------------------------------------------------------------------ referencia (Parte 3)
-
     private static Integer tentarRank()
     {
         RespostaReferencia resposta = requisitarReferencia("consultar_rank");
@@ -351,7 +327,6 @@ public class Server
         } else if (resposta.getStatus().equals("200")) {
             log("heartbeat confirmado");
         } else {
-            // a referencia removeu este servidor (ficou muito tempo sem heartbeat): cadastra de novo
             Integer novo = tentarRank();
             if (novo != null) {
                 rank = novo;
@@ -359,8 +334,6 @@ public class Server
             }
         }
     }
-
-    // ------------------------------------------------------------------ eleicao (Parte 4, valentao)
 
     private static void iniciarEleicao()
     {
@@ -383,7 +356,6 @@ public class Server
         });
     }
 
-    // so quem tem rank maior que o meu pode ganhar de mim; devolve true se precisar refazer
     private static boolean eleicao() throws InterruptedException
     {
         log("iniciando eleicao...");
@@ -428,12 +400,11 @@ public class Server
     {
         coordenador = nome;
         synchronized (trava) {
-            diferencaRelogio = 0;  // o coordenador e a referencia de hora
+            diferencaRelogio = 0;
         }
         anuncioRecebido = true;
         log("eleito coordenador (rank " + rank + ")");
 
-        // publica duas vezes para tolerar a perda da primeira por conexao recem-aberta
         for (int i = 0; i < 2; i++) {
             RespostaSub anuncio = RespostaSub.newBuilder()
                 .setTimestampEnvio(agora())
@@ -446,7 +417,6 @@ public class Server
         }
     }
 
-    // thread que escuta o topico servers, onde o coordenador eleito se anuncia
     private static void ouvirAnuncios()
     {
         ZMQ.Socket sub = context.createSocket(SocketType.SUB);
@@ -473,7 +443,6 @@ public class Server
         }
     }
 
-    // thread que responde os outros servidores (eleicao e relogio)
     private static void atenderServidores(ZMQ.Socket servidores)
     {
         while (!Thread.currentThread().isInterrupted()) {
@@ -490,15 +459,17 @@ public class Server
                 Mensagem pedido = Mensagem.parseFrom(dados);
                 atualizarRelogio(pedido.getContadorMensagem());
 
-                if (pedido.getAcao().equals("obter_estado")) {  // Parte 5: transferencia de estado
+                if (pedido.getAcao().equals("obter_estado") && !sincronizado) {
+                    resposta = criarResposta("503", "Servidor ainda sincronizando");
+                } else if (pedido.getAcao().equals("obter_estado")) {
                     resposta = criarResposta("200", exportarEstado());
                     log("estado enviado para " + pedido.getConteudo());
                 } else if (pedido.getAcao().equals("eleicao")) {
                     resposta = criarResposta("200", "OK");
-                    iniciar = true;  // quem recebe pedido de eleicao tambem participa
+                    iniciar = true;
                 } else if (pedido.getAcao().equals("sincronizar")) {
                     resposta = coordenador.equals(nome)
-                        ? criarResposta("200", "Hora correta")  // timestamp = hora do coordenador
+                        ? criarResposta("200", "Hora correta")
                         : criarResposta("400", "Nao sou o coordenador!");
                 } else {
                     resposta = criarResposta("400", "Acao desconhecida!");
@@ -515,7 +486,6 @@ public class Server
         }
     }
 
-    // a cada 15 mensagens pede a hora ao coordenador; se ele nao responder, pede eleicao
     private static void sincronizarRelogio()
     {
         String alvo = coordenador;
@@ -538,7 +508,6 @@ public class Server
             return;
         }
 
-        // a hora do coordenador ja esta velha quando chega: soma metade do tempo de ida e volta
         double horaCoordenador = resposta.getTimestamp() + (t1 - t0) / 2.0;
         double diferenca;
         synchronized (trava) {
@@ -547,8 +516,6 @@ public class Server
         }
         log(String.format("relogio sincronizado com %s (diferenca %+.0f ms)", alvo, diferenca));
     }
-
-    // ------------------------------------------------------------------ acoes dos clientes
 
     private static Resposta tratarLogin(Mensagem req)
     {
@@ -605,12 +572,6 @@ public class Server
         return criarResposta("200", "Mensagem publicada no canal " + canal + " com sucesso!");
     }
 
-    // ------------------------------------------------------------------ replicacao (Parte 5)
-    // Replicacao ativa: cada escrita aceita de um cliente (login, cadastrar, publicar) e aplicada
-    // localmente e difundida no topico "replicacao|<servidor de origem>"; todos os servidores assinam
-    // "replicacao|" e aplicam as escritas dos outros. Quem entra (ou volta) pede o estado completo a
-    // outro servidor com "obter_estado".
-
     private static final String TOPICO_REPLICACAO = "replicacao|";
 
     private static void replicar(String acao, String canal, String conteudo, double timestamp)
@@ -625,7 +586,6 @@ public class Server
         publicarNoProxy(TOPICO_REPLICACAO + nome, operacao.toByteArray());
     }
 
-    // aplica uma escrita feita por outro servidor (sem responder cliente nem republicar no canal)
     private static void aplicarOperacao(Mensagem operacao)
     {
         switch (operacao.getAcao()) {
@@ -650,7 +610,7 @@ public class Server
                 String topico = sub.recvStr();
                 byte[] corpo = sub.recv(0);
                 if (topico.equals(proprio)) {
-                    continue;  // eco da propria escrita: ja foi aplicada
+                    continue;
                 }
                 Mensagem operacao = Mensagem.parseFrom(corpo);
                 atualizarRelogio(operacao.getContadorMensagem());
@@ -672,7 +632,6 @@ public class Server
         }
     }
 
-    // junta o estado recebido com o local (sem duplicar)
     private static void importarEstado(String texto, String origem)
     {
         EstadoServidor estado = gson.fromJson(texto, EstadoServidor.class);
@@ -691,7 +650,6 @@ public class Server
         }
     }
 
-    // pede o estado ao coordenador (se for outro servidor) ou ao proximo servidor da lista
     private static void obterEstadoInicial()
     {
         String atual = coordenador;
@@ -731,7 +689,7 @@ public class Server
             try {
                 Mensagem req = Mensagem.parseFrom(dados);
                 atualizarRelogio(req.getContadorMensagem());
-                log("recebido: acao=" + req.getAcao() + " canal=" + req.getCanal()
+                log("recebido: " + req.getAcao() + " canal=" + req.getCanal()
                     + " conteudo=" + req.getConteudo() + " timestamp=" + (long) req.getTimestamp()
                     + " contador=" + req.getContadorMensagem());
                 registrar(arquivoMensagens, "req," + req.getTimestamp() + "," + req.getContadorMensagem()
@@ -745,14 +703,13 @@ public class Server
                     default -> criarResposta("400", "Acao desconhecida!");
                 };
             } catch (Exception e) {
-                // o REP sempre precisa responder, senao trava
                 log("erro ao processar mensagem: " + e.getMessage());
                 resposta = criarResposta("500", "Erro interno no servidor!");
             }
 
             registrar(arquivoMensagens, "resp," + resposta.getTimestamp() + "," + resposta.getContadorMensagem()
                 + "," + resposta.getStatus() + "," + resposta.getResposta());
-            log("enviado: status=" + resposta.getStatus() + " resposta=" + resposta.getResposta()
+            log("enviado: " + resposta.getStatus() + " " + resposta.getResposta()
                 + " timestamp=" + (long) resposta.getTimestamp() + " contador=" + resposta.getContadorMensagem());
             socket.send(resposta.toByteArray(), 0);
 
@@ -765,8 +722,6 @@ public class Server
             }
         }
     }
-
-    // ------------------------------------------------------------------ util
 
     private static void iniciarThread(Runnable tarefa)
     {

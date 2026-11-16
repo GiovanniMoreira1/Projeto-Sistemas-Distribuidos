@@ -3,25 +3,15 @@ using Google.Protobuf;
 using NetMQ;
 using NetMQ.Sockets;
 
-#region Configuracao
-
 const int tempoLimiteSegundos = 30;
 
 var servidores = new Dictionary<string, (int Rank, DateTime Heartbeat)>();
 var proximoRank = 1;
 var contador = 0;
 
-#endregion
-
-#region Socket
-
 using var responder = new ResponseSocket();
 responder.Bind("tcp://*:5556");
 Console.WriteLine("Referencia aguardando mensagens...");
-
-#endregion
-
-#region Funcoes
 
 RespostaReferencia Criar(string status, string texto, int rank = 0)
 {
@@ -42,10 +32,6 @@ void RemoverInativos()
         servidores.Remove(nome);
     }
 }
-
-#endregion
-
-#region Atendimento
 
 while (true)
 {
@@ -114,4 +100,3 @@ while (true)
     responder.SendFrame(resposta.ToByteArray());
 }
 
-#endregion

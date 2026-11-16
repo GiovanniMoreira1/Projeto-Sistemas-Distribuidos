@@ -20,15 +20,10 @@ class PublicacaoEntrada
     [JsonPropertyName("conteudo")]
     public string Conteudo { get; set; } = string.Empty;
 
-    // timestamp do envio pelo cliente (o formato antigo usava "timestampEnvioCliente")
     [JsonPropertyName("timestamp")]
     public double Timestamp { get; set; }
-
-    [JsonPropertyName("timestampEnvioCliente")]
-    public double TimestampAntigo { set => Timestamp = value; }
 }
 
-// estado completo trocado na transferencia de estado entre servidores (Parte 5)
 class EstadoServidor
 {
     [JsonPropertyName("canais")]

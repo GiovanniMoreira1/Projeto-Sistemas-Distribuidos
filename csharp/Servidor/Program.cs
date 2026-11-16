@@ -4,18 +4,13 @@ using Google.Protobuf;
 using NetMQ;
 using NetMQ.Sockets;
 
-#region Configuracao
-
 var nome = Environment.GetEnvironmentVariable("NOME_SERVIDOR") ?? Environment.MachineName;
 const int portaServidores = 5559;
 const int heartbeatACada = 10;
 const int sincronizarACada = 15;
 const string urlReferencia = "tcp://referencia:5556";
 var tempoLimite = TimeSpan.FromSeconds(3);
-
-#endregion
-
-#region Dados
+var esperaAssinatura = TimeSpan.FromSeconds(1);
 
 var diretorio = Path.Combine(Environment.GetEnvironmentVariable("DADOS_DIR") ?? "dados", nome);
 Directory.CreateDirectory(diretorio);
@@ -43,9 +38,8 @@ void AnexarLinha(string caminho, object registro)
     File.AppendAllText(caminho, JsonSerializer.Serialize(registro) + "\n");
 }
 
-// Parte 5: os dados tambem sao alterados pela thread de replicacao
 var travaDados = new object();
-// chaves do que ja esta guardado: aplicar a mesma operacao duas vezes nao duplica o registro
+
 var loginsVistos = logins.Select(l => (l.Usuario, l.Timestamp)).ToHashSet();
 var publicacoesVistas = publicacoes.Select(p => (p.Canal, p.Conteudo, p.Timestamp)).ToHashSet();
 
@@ -81,10 +75,6 @@ void RegistrarPublicacao(string canal, string conteudo, double timestamp)
     }
 }
 
-#endregion
-
-#region Estado compartilhado
-
 var trava = new object();
 var contador = 0;
 double offsetMs = 0;
@@ -92,16 +82,13 @@ var rank = 0;
 var coordenador = "";
 var emEleicao = false;
 var anuncioRecebido = new ManualResetEventSlim(false);
+var sincronizado = new ManualResetEventSlim(false);
 var mensagensRecebidas = 0;
 
 var publicador = new PublisherSocket();
 publicador.Connect("tcp://proxy:5557");
 
 void Log(string texto) => Console.WriteLine($"[{nome}] {texto}");
-
-#endregion
-
-#region Relogios
 
 double AgoraMs()
 {
@@ -117,10 +104,6 @@ void AtualizarContador(int recebido)
 {
     lock (trava) contador = Math.Max(contador, recebido);
 }
-
-#endregion
-
-#region Comunicacao
 
 Resposta CriarResposta(string status, string texto, IEnumerable<string>? lista = null)
 {
@@ -157,7 +140,6 @@ byte[]? Requisitar(string url, string acao, string conteudo = "")
     requester.Options.Linger = TimeSpan.Zero;
     try
     {
-        // o Connect resolve o nome na hora e lanca excecao se o servidor caiu (nome sumiu do DNS)
         requester.Connect(url);
         if (!requester.TrySendFrame(tempoLimite, mensagem.ToByteArray())) return null;
         return requester.TryReceiveFrameBytes(tempoLimite, out var dados) ? dados : null;
@@ -189,10 +171,6 @@ RespostaReferencia? RequisitarReferencia(string acao)
     return resposta;
 }
 
-#endregion
-
-#region Referencia
-
 int? TentarRank()
 {
     var resposta = RequisitarReferencia("consultar_rank");
@@ -216,10 +194,6 @@ void Heartbeat()
         Log($"recadastrado na referencia, rank {novo}");
     }
 }
-
-#endregion
-
-#region Eleicao
 
 void IniciarEleicao()
 {
@@ -314,15 +288,6 @@ void OuvirAnuncios()
     }
 }
 
-#endregion
-
-#region Replicacao (Parte 5)
-
-// Replicacao ativa: cada escrita aceita de um cliente (login, cadastrar, publicar) e aplicada
-// localmente e difundida no topico "replicacao|<servidor de origem>"; todos os servidores assinam
-// "replicacao|" e aplicam as escritas dos outros. Quem entra (ou volta) pede o estado completo a
-// outro servidor com "obter_estado".
-
 const string topicoReplicacao = "replicacao|";
 
 void Replicar(string acao, string canal, string conteudo, double timestamp)
@@ -369,7 +334,7 @@ void OuvirReplicacao(ManualResetEventSlim pronto)
     {
         var topico = sub.ReceiveFrameString();
         var corpo = sub.ReceiveFrameBytes();
-        if (topico == topicoReplicacao + nome) continue; // eco da propria escrita
+        if (topico == topicoReplicacao + nome) continue;
 
         var operacao = Mensagem.Parser.ParseFrom(corpo);
         AtualizarContador(operacao.ContadorMensagem);
@@ -404,7 +369,6 @@ void ImportarEstado(string texto, string origem)
     }
 }
 
-// pede o estado ao coordenador (se for outro servidor) ou ao proximo servidor da lista
 void ObterEstadoInicial()
 {
     string atual;
@@ -428,10 +392,6 @@ void ObterEstadoInicial()
     Log("nenhum outro servidor respondeu: mantendo os dados locais");
 }
 
-#endregion
-
-#region Servidor para servidor
-
 void AtenderServidores()
 {
     using var responder = new ResponseSocket();
@@ -444,7 +404,11 @@ void AtenderServidores()
 
         var iniciar = false;
         Resposta resposta;
-        if (requisicao.Acao == "obter_estado") // Parte 5: transferencia de estado
+        if (requisicao.Acao == "obter_estado" && !sincronizado.IsSet)
+        {
+            resposta = CriarResposta("503", "Servidor ainda sincronizando");
+        }
+        else if (requisicao.Acao == "obter_estado")
         {
             resposta = CriarResposta("200", ExportarEstado());
             Log($"estado enviado para {requisicao.Conteudo}");
@@ -504,10 +468,6 @@ void SincronizarRelogio()
     Log($"relogio sincronizado com {alvo} (offset {offsetMs:+0;-0;0} ms)");
 }
 
-#endregion
-
-#region Acoes dos clientes
-
 Resposta TratarLogin(Mensagem requisicao)
 {
     var usuario = requisicao.Conteudo.Trim();
@@ -559,10 +519,6 @@ Resposta TratarPublicar(Mensagem requisicao)
     return CriarResposta("200", $"Mensagem publicada no canal {canal} com sucesso!");
 }
 
-#endregion
-
-#region Atendimento de clientes
-
 void AtenderClientes()
 {
     using var responder = new ResponseSocket();
@@ -570,12 +526,16 @@ void AtenderClientes()
 
     while (true)
     {
-        var requisicao = Mensagem.Parser.ParseFrom(responder.ReceiveFrameBytes());
-        AtualizarContador(requisicao.ContadorMensagem);
+        var bytes = responder.ReceiveFrameBytes();
 
         Resposta resposta;
         try
         {
+            var requisicao = Mensagem.Parser.ParseFrom(bytes);
+            AtualizarContador(requisicao.ContadorMensagem);
+            Log($"recebido: {requisicao.Acao} canal={requisicao.Canal} conteudo={requisicao.Conteudo} " +
+                $"timestamp={requisicao.Timestamp:F0} contador={requisicao.ContadorMensagem}");
+
             resposta = requisicao.Acao switch
             {
                 "login" => TratarLogin(requisicao),
@@ -597,6 +557,7 @@ void AtenderClientes()
             resposta = CriarResposta("500", "Erro interno no servidor!");
         }
 
+        Log($"enviado: {resposta.Status} {resposta.Resposta_} timestamp={resposta.Timestamp:F0} contador={resposta.ContadorMensagem}");
         responder.SendFrame(resposta.ToByteArray());
 
         mensagensRecebidas++;
@@ -605,16 +566,11 @@ void AtenderClientes()
     }
 }
 
-#endregion
-
-#region Inicializacao
-
 Log($"dados em {diretorio}");
 
 new Thread(AtenderServidores) { IsBackground = true }.Start();
 new Thread(OuvirAnuncios) { IsBackground = true }.Start();
 
-// Parte 5: assina a replicacao antes de pedir o estado, para nao perder escritas no meio
 var replicacaoPronta = new ManualResetEventSlim(false);
 new Thread(() => OuvirReplicacao(replicacaoPronta)) { IsBackground = true }.Start();
 replicacaoPronta.Wait();
@@ -628,8 +584,9 @@ while ((rankInicial = TentarRank()) == null)
 lock (trava) rank = rankInicial.Value;
 Log($"rank {rank}");
 
+Thread.Sleep(esperaAssinatura);
 ObterEstadoInicial();
+sincronizado.Set();
 IniciarEleicao();
 AtenderClientes();
 
-#endregion

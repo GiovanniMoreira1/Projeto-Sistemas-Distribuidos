@@ -3,8 +3,6 @@ using Google.Protobuf;
 using NetMQ;
 using NetMQ.Sockets;
 
-#region Configuracao
-
 const int minCanais = 5;
 const int minInscricoes = 3;
 const int mensagensPorRodada = 10;
@@ -16,19 +14,11 @@ var aleatorio = new Random();
 var contador = 0;
 var inscritos = new HashSet<string>();
 
-#endregion
-
-#region Sockets
-
 using var requester = new RequestSocket();
 requester.Connect("tcp://broker:5559");
 using var subscriber = new SubscriberSocket();
 subscriber.Connect("tcp://proxy:5558");
 Console.WriteLine("Cliente conectado no broker e no proxy...");
-
-#endregion
-
-#region Comunicacao
 
 Resposta Requisitar(string acao, string canal = "", string conteudo = "")
 {
@@ -67,10 +57,6 @@ void MostrarPublicacao()
         $"contador={publicacao.ContadorMensagem}");
 }
 
-#endregion
-
-#region Login
-
 var candidatos = usuarios.Take(1).Concat(usuarios.Skip(1).OrderBy(_ => aleatorio.Next())).ToList();
 string? usuario = null;
 foreach (var candidato in candidatos)
@@ -90,10 +76,6 @@ if (usuario == null)
     Console.WriteLine("Nenhum usuario da lista funcionou.");
     return 1;
 }
-
-#endregion
-
-#region Bot
 
 while (true)
 {
@@ -138,4 +120,3 @@ while (true)
     }
 }
 
-#endregion

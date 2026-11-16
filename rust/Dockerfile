@@ -1,4 +1,3 @@
-# contexto de build: raiz do repositorio (usa proto/client.proto compartilhado)
 FROM rust:slim-bookworm AS build
 
 RUN apt-get update && apt-get install -y \

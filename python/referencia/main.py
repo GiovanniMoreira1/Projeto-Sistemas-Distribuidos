@@ -8,7 +8,6 @@ context = zmq.Context()
 socket = context.socket(zmq.REP)
 socket.bind("tcp://*:5556")
 
-
 servidores = {}
 
 proximo_rank = 1

@@ -1,4 +1,3 @@
-# contexto de build: raiz do repositorio (usa proto/client.proto compartilhado)
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 
 WORKDIR /src/csharp

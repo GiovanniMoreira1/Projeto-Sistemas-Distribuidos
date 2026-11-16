@@ -8,26 +8,23 @@ import zmq
 
 from client_pb2 import Mensagem, Resposta, RespostaReferencia, RespostaSub
 
-# ---------------------------------------------------------------- configuracao
 BROKER_HOST = os.environ.get("BROKER_HOST", "broker")
 PROXY_HOST = os.environ.get("PROXY_HOST", "proxy")
 REFERENCIA_HOST = os.environ.get("REFERENCIA_HOST", "referencia")
 SEED_USUARIOS = os.environ.get("SEED_USUARIOS", "seed/usuarios.json")
 
-# Nome do servidor = nome do servico no docker-compose: os outros servidores usam esse nome
-# como endereco (tcp://<nome>:5559) para pedir eleicao e sincronizacao.
 NOME_SERVIDOR = os.environ.get("NOME_SERVIDOR", socket.gethostname())
 PORTA_SERVIDORES = int(os.environ.get("PORTA_SERVIDORES", "5559"))
 BIND_HOST = os.environ.get("BIND_HOST", "*")
 
-HEARTBEAT_A_CADA = int(os.environ.get("HEARTBEAT_A_CADA", "10"))        # mensagens de clientes (Parte 3)
-SINCRONIZAR_A_CADA = int(os.environ.get("SINCRONIZAR_A_CADA", "15"))    # mensagens de clientes (Parte 4)
+HEARTBEAT_A_CADA = int(os.environ.get("HEARTBEAT_A_CADA", "10"))
+SINCRONIZAR_A_CADA = int(os.environ.get("SINCRONIZAR_A_CADA", "15"))
 TEMPO_LIMITE_MS = 3000
 ESPERA_ANUNCIO_S = 10
+ESPERA_ASSINATURA_S = 1
 
 URL_REFERENCIA = f"tcp://{REFERENCIA_HOST}:5556"
 
-# cada servidor tem o seu proprio diretorio de dados: nada e compartilhado entre servidores.
 DIRETORIO = os.path.join(os.environ.get("DADOS_DIR", "dados"), NOME_SERVIDOR)
 os.makedirs(DIRETORIO, exist_ok=True)
 
@@ -37,17 +34,18 @@ CAMINHO_LOGINS = os.path.join(DIRETORIO, "login.json")
 CAMINHO_MENSAGENS = os.path.join(DIRETORIO, "mensagens.jsonl")
 CAMINHO_PUBLICACOES = os.path.join(DIRETORIO, "publicacoes.jsonl")
 
-trava = threading.RLock()  # protege contador, offset, rank e coordenador (varias threads)
-contador = 0               # relogio logico
-offset_ms = float(os.environ.get("DESVIO_RELOGIO_MS", "0"))  # correcao do relogio fisico (Parte 4)
+trava = threading.RLock()
+contador = 0
+offset_ms = float(os.environ.get("DESVIO_RELOGIO_MS", "0"))
 rank = 0
-coordenador = ""           # nome do servidor eleito
+coordenador = ""
 em_eleicao = False
 anuncio_recebido = threading.Event()
+sincronizado = threading.Event()
 mensagens_recebidas = 0
 
 contexto = zmq.Context()
-trava_pub = threading.Lock()  # o socket PUB e usado por mais de uma thread
+trava_pub = threading.Lock()
 publicador = contexto.socket(zmq.PUB)
 publicador.connect(f"tcp://{PROXY_HOST}:5557")
 
@@ -62,7 +60,6 @@ def agora_ms():
 
 
 def proximo_contador():
-    """Regra 1: incrementa antes de cada envio."""
     global contador
     with trava:
         contador += 1
@@ -70,7 +67,6 @@ def proximo_contador():
 
 
 def atualizar_contador(recebido):
-    """Regra 2: ao receber, assume o maximo entre o valor local e o recebido."""
     global contador
     with trava:
         contador = max(contador, recebido)
@@ -84,7 +80,7 @@ def ler_json(caminho, padrao):
 
 
 def salvar_json(caminho, dados):
-    temporario = caminho + ".tmp" 
+    temporario = caminho + ".tmp"
     with open(temporario, "w", encoding="utf-8") as arquivo:
         json.dump(dados, arquivo, ensure_ascii=False, separators=(",", ":"))
     os.replace(temporario, caminho)
@@ -113,17 +109,12 @@ def salvar_jsonl(caminho, registros):
 if not os.path.exists(CAMINHO_USUARIOS):
     salvar_json(CAMINHO_USUARIOS, ler_json(SEED_USUARIOS, {"usuarios": []}))
 
+
 usuarios = ler_json(CAMINHO_USUARIOS, {"usuarios": []})
 canais = ler_json(CAMINHO_CANAIS, {"canais": []})
 logins = ler_json(CAMINHO_LOGINS, [])
-publicacoes = [
-    # formato antigo (Partes 2-4) guardava o timestamp do cliente em "timestampEnvioCliente"
-    {"canal": r["canal"], "conteudo": r["conteudo"],
-     "timestamp": r.get("timestamp", r.get("timestampEnvioCliente", 0))}
-    for r in ler_jsonl(CAMINHO_PUBLICACOES)
-]
+publicacoes = ler_jsonl(CAMINHO_PUBLICACOES)
 
-# Parte 5: os dados agora tambem sao alterados pela thread de replicacao
 trava_dados = threading.RLock()
 
 
@@ -135,7 +126,6 @@ def chave_publicacao(registro):
     return (registro["canal"], registro["conteudo"], registro["timestamp"])
 
 
-# chaves do que ja esta guardado: aplicar a mesma operacao duas vezes nao duplica o registro
 logins_vistos = {chave_login(r) for r in logins}
 publicacoes_vistas = {chave_publicacao(r) for r in publicacoes}
 
@@ -151,7 +141,6 @@ def registrar_login(usuario, timestamp, status):
 
 
 def registrar_canal(canal):
-    """Devolve False se o canal ja existia."""
     with trava_dados:
         if canal in canais["canais"]:
             return False
@@ -171,7 +160,6 @@ def registrar_publicacao(canal, conteudo, timestamp):
 
 
 def requisitar(url, acao, conteudo="", tipo=Resposta):
-    """REQ/REP com limite de tempo. Devolve None se o destino nao responder."""
     mensagem = Mensagem(
         timestamp=agora_ms(), acao=acao, conteudo=conteudo, contadorMensagem=proximo_contador()
     )
@@ -238,7 +226,6 @@ def heartbeat():
     elif resposta.status == "200":
         log("heartbeat confirmado")
     else:
-        # a referencia nos removeu da lista (ficamos muito tempo sem heartbeat): cadastra de novo
         novo = tentar_rank()
         if novo is not None:
             with trava:
@@ -289,7 +276,7 @@ def tornar_se_coordenador():
     global coordenador, offset_ms
     with trava:
         coordenador = NOME_SERVIDOR
-        offset_ms = 0.0  # o coordenador e a referencia de hora
+        offset_ms = 0.0
     anuncio_recebido.set()
     log(f"eleito coordenador (rank {rank})")
     for _ in range(2):
@@ -332,17 +319,19 @@ def atender_servidores():
             requisicao.ParseFromString(dados)
             atualizar_contador(requisicao.contadorMensagem)
 
-            if requisicao.acao == "obter_estado":  # Parte 5: transferencia de estado
+            if requisicao.acao == "obter_estado" and not sincronizado.is_set():
+                resposta = criar_resposta("503", "Servidor ainda sincronizando")
+            elif requisicao.acao == "obter_estado":
                 resposta = criar_resposta("200", exportar_estado())
                 log(f"estado enviado para {requisicao.conteudo}")
             elif requisicao.acao == "eleicao":
                 resposta = criar_resposta("200", "OK")
-                iniciar = True  # quem recebe pedido de eleicao tambem participa (Bully)
+                iniciar = True
             elif requisicao.acao == "sincronizar":
                 with trava:
                     sou_coordenador = coordenador == NOME_SERVIDOR
                 if sou_coordenador:
-                    resposta = criar_resposta("200", "Hora correta")  # timestamp = hora do coordenador
+                    resposta = criar_resposta("200", "Hora correta")
                 else:
                     resposta = criar_resposta("400", "Não sou o coordenador!")
             else:
@@ -357,8 +346,6 @@ def atender_servidores():
 
 
 def sincronizar_relogio():
-    """Pede a hora ao coordenador (a cada SINCRONIZAR_A_CADA mensagens). Se ele nao responder,
-    inicia uma eleicao."""
     global offset_ms
     with trava:
         alvo = coordenador
@@ -379,19 +366,13 @@ def sincronizar_relogio():
         iniciar_eleicao()
         return
 
-    hora_coordenador = resposta.timestamp + (t1 - t0) / 2  # compensa metade do tempo de ida e volta
+    hora_coordenador = resposta.timestamp + (t1 - t0) / 2
     with trava:
         anterior = offset_ms
         offset_ms = hora_coordenador - t1
         valor = offset_ms
     log(f"relogio sincronizado com {alvo} (offset {anterior:+.0f} -> {valor:+.0f} ms)")
 
-
-# ---------------------------------------------------------------- Parte 5: replicacao
-# Replicacao ativa: cada escrita aceita de um cliente (login, cadastrar, publicar) e aplicada
-# localmente e difundida no topico "replicacao|<servidor de origem>"; todos os servidores assinam
-# "replicacao|" e aplicam as escritas dos outros. Quem entra (ou volta) pede o estado completo a
-# outro servidor com "obter_estado".
 
 TOPICO_REPLICACAO = "replicacao|"
 
@@ -405,7 +386,6 @@ def replicar(acao, canal, conteudo, timestamp):
 
 
 def aplicar_operacao(operacao):
-    """Aplica uma escrita feita por outro servidor (sem responder cliente nem republicar)."""
     if operacao.acao == "login":
         usuario = operacao.conteudo
         status = "200" if usuario in usuarios["usuarios"] else "404"
@@ -425,7 +405,7 @@ def ouvir_replicacao(pronto):
     while True:
         topico, corpo = sub.recv_multipart()
         if topico == proprio:
-            continue  # eco da propria escrita: ja foi aplicada
+            continue
         operacao = Mensagem()
         operacao.ParseFromString(corpo)
         atualizar_contador(operacao.contadorMensagem)
@@ -444,7 +424,6 @@ def exportar_estado():
 
 
 def importar_estado(texto):
-    """Junta o estado recebido com o local (sem duplicar) e regrava os arquivos."""
     estado = json.loads(texto)
     with trava_dados:
         for canal in estado.get("canais", []):
@@ -458,7 +437,6 @@ def importar_estado(texto):
 
 
 def obter_estado_inicial():
-    """Pede o estado ao coordenador (se for outro servidor) ou ao proximo servidor da lista."""
     with trava:
         atual = coordenador
     outros = [s.nome for s in listar_servidores() if s.nome != NOME_SERVIDOR]
@@ -498,7 +476,7 @@ def tratar_cadastrar(requisicao):
     if not canal or len(canal) > 50 or "|" in canal:
         return criar_resposta("400", "Nome de canal invalido!")
     if not registrar_canal(canal):
-        return criar_resposta("404", "Canal já existe!")  # mesmo codigo do servidor JS
+        return criar_resposta("404", "Canal já existe!")
 
     replicar("cadastrar", "", canal, requisicao.timestamp)
     return criar_resposta("200", f"Canal {canal} cadastrado com sucesso!")
@@ -544,6 +522,8 @@ def atender_clientes():
             requisicao = Mensagem()
             requisicao.ParseFromString(dados)
             atualizar_contador(requisicao.contadorMensagem)
+            log(f"recebido: {requisicao.acao} canal={requisicao.canal} conteudo={requisicao.conteudo} "
+                f"timestamp={requisicao.timestamp:.0f} contador={requisicao.contadorMensagem}")
 
             tratador = ACOES.get(requisicao.acao)
             if tratador is None:
@@ -567,10 +547,12 @@ def atender_clientes():
                     "contadorMensagem": resposta.contadorMensagem,
                 },
             })
-        except Exception as erro:  # o REP precisa sempre responder, senao trava
+        except Exception as erro:
             log(f"erro ao processar mensagem: {erro}")
             resposta = criar_resposta("500", "Erro interno no servidor!")
 
+        log(f"enviado: {resposta.status} {resposta.resposta} "
+            f"timestamp={resposta.timestamp:.0f} contador={resposta.contadorMensagem}")
         responder.send(resposta.SerializeToString())
 
         mensagens_recebidas += 1
@@ -585,7 +567,6 @@ log(f"dados em {DIRETORIO}")
 threading.Thread(target=atender_servidores, daemon=True).start()
 threading.Thread(target=ouvir_anuncios, daemon=True).start()
 
-# Parte 5: assina a replicacao antes de pedir o estado, para nao perder escritas no meio
 replicacao_pronta = threading.Event()
 threading.Thread(target=ouvir_replicacao, args=(replicacao_pronta,), daemon=True).start()
 replicacao_pronta.wait()
@@ -593,6 +574,8 @@ replicacao_pronta.wait()
 rank = consultar_rank()
 log(f"rank {rank}")
 
+time.sleep(ESPERA_ASSINATURA_S)
 obter_estado_inicial()
+sincronizado.set()
 iniciar_eleicao()
 atender_clientes()

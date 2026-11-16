@@ -4,7 +4,6 @@ enunciado
 **/node_modules
 **/target
 **/__pycache__
-# saidas de build do C# (nao usar "**/bin": apagaria o rust/src/bin)
 csharp/**/bin
 csharp/**/obj
 csharp/.vs

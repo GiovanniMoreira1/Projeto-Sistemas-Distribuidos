@@ -43,7 +43,6 @@ fn enviar_requisicao(
 
 fn receber_publicacoes(subscriber: zmq::Socket, inscricoes: Receiver<String>, contador: Arc<AtomicI32>) {
     loop {
-        // novas inscricoes pedidas pela thread principal (o socket so e usado nesta thread)
         while let Ok(canal) = inscricoes.try_recv() {
             let topico = format!("{canal}|");
             if let Err(err) = subscriber.set_subscribe(topico.as_bytes()) {
@@ -118,7 +117,6 @@ fn main() -> zmq::Result<()> {
     let usuario = usuarios[indice_usuario];
     println!("[{usuario}] {}", reply.resposta);
 
-    // o SUB fica numa thread propria; as inscricoes sao pedidas pela thread principal via canal
     let (tx_inscricao, rx_inscricao) = mpsc::channel::<String>();
     let contador_sub = Arc::clone(&contador);
     thread::spawn(move || receber_publicacoes(subscriber, rx_inscricao, contador_sub));
@@ -126,7 +124,6 @@ fn main() -> zmq::Result<()> {
     let mut rng = rand::thread_rng();
     let mut inscritos: HashSet<String> = HashSet::new();
 
-    // comportamento padronizado dos bots (Parte 2)
     loop {
         let mut canais = enviar_requisicao(&requester, &contador, "listar", "", "")?.canais;
 

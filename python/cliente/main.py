@@ -15,11 +15,10 @@ MIN_INSCRICOES = 3
 MENSAGENS_POR_RODADA = 10
 INTERVALO_S = 1
 
-# O primeiro nome e proposital: nao existe, para exercitar o retry de login.
 USUARIOS = ["usuario_inexistente", "teste"] + [f"teste{i}" for i in range(2, 11)]
 PALAVRAS = ["ola", "bom dia", "alguem ai?", "teste", "sistemas distribuidos", "zeromq", "protobuf", "python"]
 
-contador = 0  # relogio logico (contadorMensagem)
+contador = 0
 
 
 def agora_ms():
@@ -69,7 +68,6 @@ def mostrar_publicacao():
 
 
 def esperar(segundos):
-    """Espera `segundos` recebendo (e exibindo) as publicacoes que chegarem nesse tempo."""
     fim = time.time() + segundos
     while (restante := fim - time.time()) > 0:
         if subscriber.poll(int(restante * 1000)):
@@ -81,6 +79,7 @@ def inscrever(canal):
     inscritos.add(canal)
     print(f"[{usuario}] inscrito no {canal}", flush=True)
 
+
 candidatos = [USUARIOS[0]] + random.sample(USUARIOS[1:], len(USUARIOS) - 1)
 usuario = None
 for candidato in candidatos:
@@ -91,9 +90,11 @@ for candidato in candidatos:
         break
     print(f"[{candidato}] Erro {resposta.status}: {resposta.resposta}", flush=True)
 
+
 if usuario is None:
     print("Nenhum usuario da lista funcionou.", flush=True)
     sys.exit(1)
+
 
 while True:
     canais = list(requisitar("listar").canais)

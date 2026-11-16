@@ -15,11 +15,6 @@ import java.util.List;
 import java.util.Random;
 import java.util.Set;
 
-/**
- * Bot Java. Usa o contrato comum do grupo (proto/client.proto) e o comportamento padronizado
- * dos bots (Parte 2): garante >= 5 canais, >= 3 inscricoes e publica 10 mensagens por rodada
- * com 1 segundo de intervalo.
- */
 public class Client
 {
     private static final int MIN_CANAIS = 5;
@@ -27,11 +22,10 @@ public class Client
     private static final int MENSAGENS_POR_RODADA = 10;
     private static final long INTERVALO_MS = 1000;
 
-    // o primeiro nome nao existe de proposito, para exercitar a repeticao do login
     private static final List<String> USUARIOS = List.of(
         "Felipe", "teste", "teste2", "teste3", "teste4", "teste5", "teste6", "teste7", "teste8", "teste9", "teste10");
 
-    private static int relogio = 0;  // relogio logico (so a thread principal usa)
+    private static int relogio = 0;
     private static ZMQ.Socket requester;
     private static ZMQ.Socket sub;
     private static final Random random = new Random();
@@ -126,7 +120,6 @@ public class Client
         return resposta;
     }
 
-    // espera o intervalo mostrando as publicacoes que chegarem nesse tempo
     private static void esperar(long ms) throws Exception
     {
         long fim = System.currentTimeMillis() + ms;

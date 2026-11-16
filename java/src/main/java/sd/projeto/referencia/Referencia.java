@@ -12,17 +12,11 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-/**
- * Servico de referencia em Java (contrato comum: consultar_rank, listar_servidores, heartbeat).
- * O docker-compose do projeto unificado usa a referencia em Python; esta fica como alternativa.
- */
 public class Referencia {
-
     private static final long TEMPO_LIMITE = 30000;
 
     public static void main(String[] args) throws Exception {
         try (ZContext context = new ZContext()) {
-
             ZMQ.Socket socket = context.createSocket(SocketType.REP);
             socket.bind("tcp://*:5556");
 
@@ -39,7 +33,6 @@ public class Referencia {
             while (!Thread.currentThread().isInterrupted()) {
                 poller.poll(1000);
 
-                // tira da lista quem ficou muito tempo sem heartbeat
                 long agora = System.currentTimeMillis();
                 List<String> inativos = new ArrayList<>();
                 for (String nome : ultimoHeartbeat.keySet()) {
@@ -93,7 +86,6 @@ public class Referencia {
                     default -> resposta.setStatus("400").setResposta("Ação desconhecida!");
                 }
 
-                // heartbeat nao devolve a hora: quem acerta o relogio e o coordenador (Parte 4)
                 resposta.setContadorMensagem(++relogio);
                 socket.send(resposta.build().toByteArray(), 0);
             }
